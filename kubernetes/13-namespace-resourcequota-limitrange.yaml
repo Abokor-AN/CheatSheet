@@ -1,0 +1,314 @@
+# ============================================================
+# KUBERNETES NAMESPACE, RESOURCEQUOTA, LIMITRANGE - CHEATSHEET
+# ============================================================
+
+# ─────────────────────────────────────────────────────────────
+# NAMESPACE
+# ─────────────────────────────────────────────────────────────
+# Isolation logique des ressources dans le cluster.
+# Namespaces système: default, kube-system, kube-public, kube-node-lease
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: production
+  labels:
+    environment: production
+    team: backend
+    kubernetes.io/metadata.name: production  # Auto-ajouté par K8s
+
+  annotations:
+    owner: "team-backend@company.com"
+    cost-center: "cc-12345"
+    # Cert-manager
+    certmanager.k8s.io/cluster-issuer: "letsencrypt-prod"
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: staging
+  labels:
+    environment: staging
+    team: backend
+
+---
+# ─────────────────────────────────────────────────────────────
+# RESOURCEQUOTA - Limite les ressources totales d'un namespace
+# ─────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: production-quota
+  namespace: production
+
+spec:
+  hard:
+    # ── Compute Resources ─────────────────────────────────
+    requests.cpu: "10"                # Total CPU requests du namespace
+    limits.cpu: "20"                  # Total CPU limits du namespace
+    requests.memory: 20Gi             # Total memory requests
+    limits.memory: 40Gi               # Total memory limits
+    requests.ephemeral-storage: 50Gi  # Total stockage éphémère requests
+    limits.ephemeral-storage: 100Gi
+
+    # ── Objets K8s ────────────────────────────────────────
+    pods: "50"                        # Nombre max de pods
+    services: "20"                    # Nombre max de services
+    secrets: "100"                    # Nombre max de secrets
+    configmaps: "50"                  # Nombre max de configmaps
+    persistentvolumeclaims: "20"      # Nombre max de PVCs
+    services.loadbalancers: "5"       # Nombre max de LB services
+    services.nodeports: "10"          # Nombre max de NodePort services
+    replicationcontrollers: "10"
+    resourcequotas: "5"
+    deployments.apps: "20"
+    replicasets.apps: "30"
+    statefulsets.apps: "10"
+    jobs.batch: "20"
+    cronjobs.batch: "10"
+
+    # ── Stockage ──────────────────────────────────────────
+    requests.storage: "500Gi"         # Total de stockage PVC
+    gold.storageclass.storage.k8s.io/requests.storage: "100Gi"  # Par StorageClass
+    silver.storageclass.storage.k8s.io/requests.storage: "200Gi"
+    bronze.storageclass.storage.k8s.io/requests.storage: "300Gi"
+    gold.storageclass.storage.k8s.io/persistentvolumeclaims: "5"
+
+  # ── Scope (limiter à certains types de pods) ─────────────
+  scopeSelector:
+    matchExpressions:
+      - operator: In                  # In | NotIn | Exists | DoesNotExist
+        scopeName: PriorityClass      # BestEffort | NotBestEffort | Terminating | NotTerminating | PriorityClass | CrossNamespacePodAffinity
+        values: ["high-priority"]
+
+---
+# ResourceQuota par classe de priorité
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: critical-pods-quota
+  namespace: production
+spec:
+  hard:
+    pods: "5"
+    requests.cpu: "2"
+    limits.cpu: "4"
+  scopeSelector:
+    matchExpressions:
+      - operator: In
+        scopeName: PriorityClass
+        values: ["system-cluster-critical"]
+
+---
+# ResourceQuota simple (seulement objets)
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: object-counts
+  namespace: development
+spec:
+  hard:
+    pods: "10"
+    services: "5"
+    secrets: "20"
+    configmaps: "10"
+    persistentvolumeclaims: "5"
+
+---
+# ─────────────────────────────────────────────────────────────
+# LIMITRANGE - Définit les limites par pod/conteneur/PVC
+# ─────────────────────────────────────────────────────────────
+# S'applique automatiquement aux nouveaux objets sans limites définies.
+
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: production-limits
+  namespace: production
+
+spec:
+  limits:
+    # ── Limites par Conteneur ─────────────────────────────
+    - type: Container
+      default:                        # Limits par défaut (si non spécifiées)
+        cpu: "500m"
+        memory: 256Mi
+      defaultRequest:                 # Requests par défaut (si non spécifiées)
+        cpu: "100m"
+        memory: 128Mi
+      max:                            # Maximum autorisé
+        cpu: "4"
+        memory: 8Gi
+      min:                            # Minimum requis
+        cpu: "50m"
+        memory: 32Mi
+      maxLimitRequestRatio:           # Ratio max limits/requests
+        cpu: "10"                     # limits.cpu <= 10 * requests.cpu
+        memory: "4"
+
+    # ── Limites par Pod ───────────────────────────────────
+    - type: Pod
+      max:                            # Somme de tous les conteneurs du pod
+        cpu: "8"
+        memory: 16Gi
+      min:
+        cpu: "50m"
+        memory: 32Mi
+      maxLimitRequestRatio:
+        cpu: "4"
+
+    # ── Limites par PVC ───────────────────────────────────
+    - type: PersistentVolumeClaim
+      max:
+        storage: 100Gi               # PVC max 100Gi
+      min:
+        storage: 1Gi                 # PVC min 1Gi
+
+---
+# LimitRange pour namespace de développement (plus permissif)
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: dev-limits
+  namespace: development
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: "200m"
+        memory: 128Mi
+      defaultRequest:
+        cpu: "50m"
+        memory: 64Mi
+      max:
+        cpu: "2"
+        memory: 4Gi
+
+---
+# ─────────────────────────────────────────────────────────────
+# PRIORITYCLASS
+# ─────────────────────────────────────────────────────────────
+# Définit la priorité des pods pour le scheduling et la préemption.
+
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: high-priority
+value: 1000000                        # Valeur (plus haute = plus prioritaire)
+globalDefault: false                  # UNE SEULE PriorityClass peut être globalDefault
+description: "Pour les pods critiques de production"
+preemptionPolicy: PreemptLowerPriority  # PreemptLowerPriority | Never
+
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: low-priority
+value: 100
+globalDefault: false
+description: "Pour les tâches batch non-critiques"
+preemptionPolicy: Never               # Ne peut pas préempter d'autres pods
+
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: default-priority
+value: 500
+globalDefault: true                   # Appliqué si aucune PriorityClass spécifiée
+description: "Priorité par défaut"
+
+---
+# Classes système (pré-installées):
+# system-cluster-critical: 2000000000  (kube-dns, coredns, etc.)
+# system-node-critical:    2000001000  (kube-proxy, fluentd, etc.)
+
+---
+# ─────────────────────────────────────────────────────────────
+# EXEMPLE COMPLET: Namespace avec toutes les politiques
+# ─────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-app
+  labels:
+    environment: production
+    team: team-a
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: team-quota
+  namespace: team-app
+spec:
+  hard:
+    requests.cpu: "4"
+    limits.cpu: "8"
+    requests.memory: 8Gi
+    limits.memory: 16Gi
+    pods: "20"
+    services: "10"
+    persistentvolumeclaims: "10"
+    requests.storage: "100Gi"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: team-limitrange
+  namespace: team-app
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: "300m"
+        memory: 256Mi
+      defaultRequest:
+        cpu: "100m"
+        memory: 128Mi
+      max:
+        cpu: "2"
+        memory: 4Gi
+      min:
+        cpu: "50m"
+        memory: 32Mi
+    - type: PersistentVolumeClaim
+      max:
+        storage: 20Gi
+      min:
+        storage: 1Gi
+
+---
+# ─────────────────────────────────────────────────────────────
+# COMMANDES KUBECTL
+# ─────────────────────────────────────────────────────────────
+#
+# Namespaces:
+#   kubectl get namespaces
+#   kubectl get ns
+#   kubectl describe namespace production
+#   kubectl create namespace my-ns
+#   kubectl delete namespace my-ns    # ATTENTION: supprime TOUT dans le namespace
+#
+# ResourceQuota:
+#   kubectl get resourcequota -n production
+#   kubectl describe resourcequota production-quota -n production
+#   # Affiche: Hard (limite) | Used (utilisé) | Remaining (disponible)
+#
+# LimitRange:
+#   kubectl get limitrange -n production
+#   kubectl describe limitrange production-limits -n production
+#
+# PriorityClass:
+#   kubectl get priorityclass
+#   kubectl describe priorityclass high-priority
+#
+# Contexte (namespace courant):
+#   kubectl config set-context --current --namespace=production
+#   kubectl config view --minify | grep namespace
+#   kubens production               # Avec kubens plugin
+#
+# Voir les ressources utilisées:
+#   kubectl top pods -n production
+#   kubectl top nodes
+#   kubectl describe ns production  # Résumé de la quota utilisation

@@ -1,0 +1,287 @@
+# ============================================================
+# KUBERNETES STATEFULSET - CHEATSHEET COMPLET
+# ============================================================
+# Pour les applications avec état: bases de données, caches, queues.
+# Fournit: identités stables, stockage persistant, déploiement ordonné.
+
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: my-statefulset
+  namespace: default
+  labels:
+    app: my-db
+
+spec:
+  # ─── CONFIGURATION DE BASE ────────────────────────────────
+  replicas: 3
+  serviceName: my-headless-service      # REQUIS - Service headless pour DNS
+                                        # DNS: pod-0.my-headless-service.namespace.svc.cluster.local
+
+  selector:
+    matchLabels:
+      app: my-db
+
+  # ─── STRATÉGIE DE MISE À JOUR ─────────────────────────────
+  updateStrategy:
+    type: RollingUpdate                 # RollingUpdate | OnDelete
+    rollingUpdate:
+      partition: 0                      # Met à jour seulement les pods >= partition
+                                        # (Canary: partition=2 → met à jour pod-2 seulement)
+      maxUnavailable: 1                 # K8s 1.24+
+
+  # ─── POLITIQUE DE GESTION DES PODS ───────────────────────
+  podManagementPolicy: OrderedReady     # OrderedReady | Parallel
+  # OrderedReady: pods créés/supprimés séquentiellement (0,1,2...)
+  # Parallel: tous les pods créés/supprimés simultanément
+
+  # ─── RÉVISIONS ────────────────────────────────────────────
+  revisionHistoryLimit: 10
+
+  # ─── POLITIQUE DE RÉTENTION DES PVC ──────────────────────
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain                 # Retain | Delete - quand StatefulSet supprimé
+    whenScaled: Retain                  # Retain | Delete - quand scale down
+
+  # ─── TEMPLATE DU POD ──────────────────────────────────────
+  template:
+    metadata:
+      labels:
+        app: my-db
+
+    spec:
+      terminationGracePeriodSeconds: 60  # Temps pour arrêt gracieux des DBs
+
+      # Init container pour setup
+      initContainers:
+        - name: init-mysql
+          image: mysql:8.0
+          command:
+            - bash
+            - "-c"
+            - |
+              set -ex
+              # Déterminer l'index du pod (extrait du hostname)
+              [[ $HOSTNAME =~ -([0-9]+)$ ]] || exit 1
+              ordinal=${BASH_REMATCH[1]}
+              echo [mysqld] > /mnt/conf.d/server-id.cnf
+              echo server-id=$((100 + $ordinal)) >> /mnt/conf.d/server-id.cnf
+              if [[ $ordinal -eq 0 ]]; then
+                cp /mnt/config-map/master.cnf /mnt/conf.d/
+              else
+                cp /mnt/config-map/slave.cnf /mnt/conf.d/
+              fi
+          volumeMounts:
+            - name: conf
+              mountPath: /mnt/conf.d
+            - name: config-map
+              mountPath: /mnt/config-map
+
+      containers:
+        - name: mysql
+          image: mysql:8.0
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: mysql
+              containerPort: 3306
+
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-secret
+                  key: root-password
+            - name: MYSQL_DATABASE
+              value: mydb
+
+          # Variables Downward API (utile pour StatefulSets)
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+
+          volumeMounts:
+            - name: data                # Volume du PVC template
+              mountPath: /var/lib/mysql
+              subPath: mysql            # Sous-dossier (évite perte de données)
+            - name: conf
+              mountPath: /etc/mysql/conf.d
+            - name: tmp
+              mountPath: /tmp
+
+          livenessProbe:
+            exec:
+              command:
+                - mysqladmin
+                - ping
+                - -h
+                - localhost
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          readinessProbe:
+            exec:
+              command:
+                - mysql
+                - -h
+                - localhost
+                - -e
+                - "SELECT 1"
+            initialDelaySeconds: 5
+            periodSeconds: 2
+            timeoutSeconds: 1
+            failureThreshold: 3
+
+          lifecycle:
+            preStop:
+              exec:
+                command: ["mysqladmin", "shutdown"]
+
+          securityContext:
+            runAsUser: 999              # mysql user
+            runAsGroup: 999
+            runAsNonRoot: true
+            readOnlyRootFilesystem: false  # MySQL a besoin d'écrire
+            allowPrivilegeEscalation: false
+
+      volumes:
+        - name: conf
+          emptyDir: {}
+        - name: config-map
+          configMap:
+            name: mysql-config
+        - name: tmp
+          emptyDir: {}
+
+      securityContext:
+        fsGroup: 999                    # GID pour les volumes
+
+      affinity:
+        podAntiAffinity:                # Répartir les répliques sur différents nœuds
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: my-db
+              topologyKey: kubernetes.io/hostname
+
+      serviceAccountName: my-db-sa
+      imagePullSecrets:
+        - name: registry-secret
+
+  # ─── TEMPLATES DE PVC ─────────────────────────────────────
+  # Créés automatiquement pour chaque pod (nom: <pvc-name>-<pod-name>)
+  # Ex: data-my-statefulset-0, data-my-statefulset-1, data-my-statefulset-2
+  volumeClaimTemplates:
+    - metadata:
+        name: data                      # Référencé dans volumeMounts[].name
+        labels:
+          app: my-db
+        annotations:
+          volume.beta.kubernetes.io/storage-class: fast-ssd
+      spec:
+        accessModes:
+          - ReadWriteOnce               # RWO: un seul nœud
+          # - ReadWriteMany             # RWX: plusieurs nœuds
+          # - ReadOnlyMany              # ROX: plusieurs nœuds en lecture
+        storageClassName: fast-ssd     # StorageClass à utiliser
+        resources:
+          requests:
+            storage: 100Gi
+        selector:                       # Sélectionner un PV spécifique (optionnel)
+          matchLabels:
+            type: fast
+
+    - metadata:
+        name: logs
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: standard
+        resources:
+          requests:
+            storage: 10Gi
+
+---
+# ─────────────────────────────────────────────────────────────
+# SERVICE HEADLESS (REQUIS pour StatefulSet)
+# ─────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-headless-service
+spec:
+  clusterIP: None                       # Headless
+  selector:
+    app: my-db
+  ports:
+    - name: mysql
+      port: 3306
+      targetPort: 3306
+  publishNotReadyAddresses: true        # Inclure pods en démarrage (pour discovery)
+
+---
+# ─────────────────────────────────────────────────────────────
+# SERVICE LECTURE-ÉCRITURE (accès au pod principal)
+# ─────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-db-write
+spec:
+  selector:
+    app: my-db
+    statefulset.kubernetes.io/pod-name: my-statefulset-0  # Toujours pod-0
+  ports:
+    - port: 3306
+      targetPort: 3306
+
+---
+# ─────────────────────────────────────────────────────────────
+# COMMANDES KUBECTL
+# ─────────────────────────────────────────────────────────────
+#
+# kubectl apply -f statefulset.yaml
+# kubectl get statefulsets
+# kubectl get sts
+# kubectl describe statefulset my-statefulset
+#
+# Pods (nommés de façon ordonnée):
+#   kubectl get pods -l app=my-db
+#   # → my-statefulset-0, my-statefulset-1, my-statefulset-2
+#
+# PVCs (créés automatiquement):
+#   kubectl get pvc -l app=my-db
+#   # → data-my-statefulset-0, data-my-statefulset-1, ...
+#
+# Accès à un pod spécifique:
+#   kubectl exec -it my-statefulset-0 -- mysql -u root -p
+#
+# Scaling:
+#   kubectl scale statefulset my-statefulset --replicas=5
+#
+# Rollout:
+#   kubectl rollout status statefulset/my-statefulset
+#   kubectl rollout history statefulset/my-statefulset
+#   kubectl rollout undo statefulset/my-statefulset
+#
+# Mise à jour partielle (Canary):
+#   kubectl patch statefulset my-statefulset -p '{"spec":{"updateStrategy":{"rollingUpdate":{"partition":2}}}}'
+#
+# DNS des pods:
+#   pod-0.my-headless-service.default.svc.cluster.local
+#   pod-1.my-headless-service.default.svc.cluster.local

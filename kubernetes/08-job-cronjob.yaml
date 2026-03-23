@@ -1,0 +1,318 @@
+# ============================================================
+# KUBERNETES JOB - CHEATSHEET COMPLET
+# ============================================================
+# Exécute une ou plusieurs tâches jusqu'à completion.
+# Cas d'usage: migrations DB, batch processing, tâches ponctuelles.
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: my-job
+  namespace: default
+  labels:
+    app: my-batch
+  annotations:
+    description: "Database migration job"
+
+spec:
+  # ─── CONFIGURATION DU JOB ─────────────────────────────────
+
+  completions: 3                        # Nombre total d'exécutions réussies requises
+  parallelism: 2                        # Nombre d'exécutions en parallèle
+  completionMode: NonIndexed            # NonIndexed | Indexed
+
+  # Indexed: chaque pod reçoit un index unique (JOB_COMPLETION_INDEX env var)
+  # completionMode: Indexed
+  # completions: 5                      # Avec Indexed: 5 pods avec index 0-4
+
+  backoffLimit: 4                       # Nb de tentatives avant échec du Job
+  backoffLimitPerIndex: 1               # K8s 1.29+ (avec Indexed)
+  maxFailedIndexes: 2                   # K8s 1.29+ (avec Indexed)
+
+  activeDeadlineSeconds: 600           # Durée max avant annulation forcée
+  ttlSecondsAfterFinished: 3600        # Auto-suppression après completion (K8s 1.23+)
+  # ttlSecondsAfterFinished: 0         # Suppression immédiate
+
+  suspend: false                        # Suspendre le Job (K8s 1.24+)
+
+  # Politique de gestion des pods (K8s 1.25+)
+  podFailurePolicy:
+    rules:
+      - action: FailJob                 # FailJob | Ignore | Count
+        onExitCodes:
+          containerName: main
+          operator: In                  # In | NotIn
+          values: [1, 2, 3]
+      - action: Ignore
+        onPodConditions:
+          - type: DisruptionTarget      # Preemption, eviction
+
+  # ─── TEMPLATE DU POD ──────────────────────────────────────
+  template:
+    metadata:
+      labels:
+        app: my-batch
+        job-name: my-job
+
+    spec:
+      restartPolicy: OnFailure          # Never | OnFailure (OBLIGATOIRE pour Job)
+      # Never: crée un nouveau pod à chaque échec
+      # OnFailure: redémarre le conteneur dans le même pod
+
+      containers:
+        - name: main
+          image: my-migration:1.0
+          imagePullPolicy: IfNotPresent
+
+          command: ["/bin/sh"]
+          args: ["-c", "python migrate.py && echo Migration completed"]
+
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: db-secret
+                  key: url
+            - name: JOB_COMPLETION_INDEX  # Disponible en mode Indexed
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: tmp
+          emptyDir: {}
+
+      serviceAccountName: batch-sa
+      terminationGracePeriodSeconds: 30
+
+      # Scheduling pour Jobs batch
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: node-type
+                    operator: In
+                    values: ["batch"]
+
+---
+# ─────────────────────────────────────────────────────────────
+# JOB PARALLÈLE - Work Queue Pattern
+# ─────────────────────────────────────────────────────────────
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: parallel-job
+spec:
+  parallelism: 5                        # 5 workers en parallèle
+  completions: 20                       # 20 items à traiter
+  completionMode: Indexed               # Chaque worker a un index unique
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: worker
+          image: my-worker:1.0
+          env:
+            - name: ITEM_INDEX
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+          command: ["process-item"]
+          args: ["$(ITEM_INDEX)"]
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+
+---
+# ============================================================
+# KUBERNETES CRONJOB - CHEATSHEET COMPLET
+# ============================================================
+# Exécute des Jobs selon un planning cron.
+# Cas d'usage: sauvegardes, rapports, nettoyage, synchronisation.
+
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: my-cronjob
+  namespace: default
+  labels:
+    app: scheduled-task
+
+spec:
+  # ─── PLANNING CRON ────────────────────────────────────────
+  # Format: minute heure jour-du-mois mois jour-de-semaine
+  # ┌──────────── minute (0-59)
+  # │ ┌────────── heure (0-23)
+  # │ │ ┌──────── jour du mois (1-31)
+  # │ │ │ ┌────── mois (1-12 ou jan-dec)
+  # │ │ │ │ ┌──── jour de semaine (0-7, 0=dimanche, 7=dimanche)
+  # │ │ │ │ │
+  # * * * * *
+
+  schedule: "0 2 * * *"                # Tous les jours à 2h00
+
+  # Exemples de plannings:
+  # "*/5 * * * *"     Toutes les 5 minutes
+  # "0 * * * *"       Toutes les heures
+  # "0 0 * * *"       Tous les jours à minuit
+  # "0 0 * * 0"       Chaque dimanche à minuit
+  # "0 0 1 * *"       Le 1er de chaque mois à minuit
+  # "0 9-17 * * 1-5"  Toutes les heures de 9h à 17h en semaine
+  # "@hourly"         Équivalent "0 * * * *"
+  # "@daily"          Équivalent "0 0 * * *"
+  # "@weekly"         Équivalent "0 0 * * 0"
+  # "@monthly"        Équivalent "0 0 1 * *"
+  # "@yearly"         Équivalent "0 0 1 1 *"
+  # "@midnight"       Équivalent "@daily"
+
+  timezone: "Europe/Paris"             # Fuseau horaire (K8s 1.27+)
+
+  # ─── POLITIQUE D'EXÉCUTION CONCURRENTE ────────────────────
+  concurrencyPolicy: Forbid             # Allow | Forbid | Replace
+  # Allow: plusieurs jobs peuvent tourner en même temps
+  # Forbid: skip si job précédent pas fini
+  # Replace: annule le job en cours et lance le nouveau
+
+  # ─── GESTION DES JOBS ─────────────────────────────────────
+  successfulJobsHistoryLimit: 3        # Nb de jobs réussis conservés
+  failedJobsHistoryLimit: 1            # Nb de jobs échoués conservés
+
+  startingDeadlineSeconds: 300         # Délai max pour démarrer (si manqué)
+  # Si null: pas de deadline
+  # Si 0: job manqué si pas démarré immédiatement
+
+  suspend: false                        # Suspendre les nouvelles exécutions
+
+  # ─── TEMPLATE DU JOB ──────────────────────────────────────
+  jobTemplate:
+    metadata:
+      labels:
+        app: scheduled-task
+      annotations:
+        description: "Scheduled backup job"
+
+    spec:
+      ttlSecondsAfterFinished: 86400   # Supprimer le job 24h après
+
+      template:
+        metadata:
+          labels:
+            app: scheduled-task
+
+        spec:
+          restartPolicy: OnFailure
+
+          containers:
+            - name: backup
+              image: my-backup:1.0
+              imagePullPolicy: IfNotPresent
+
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -e
+                  echo "Starting backup at $(date)"
+                  pg_dump -h $DB_HOST -U $DB_USER -d $DB_NAME > /backup/dump_$(date +%Y%m%d_%H%M%S).sql
+                  echo "Backup completed successfully"
+
+              env:
+                - name: DB_HOST
+                  valueFrom:
+                    secretKeyRef:
+                      name: db-secret
+                      key: host
+                - name: DB_USER
+                  valueFrom:
+                    secretKeyRef:
+                      name: db-secret
+                      key: username
+                - name: DB_NAME
+                  value: "production"
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: db-secret
+                      key: password
+
+              resources:
+                requests:
+                  cpu: "100m"
+                  memory: "256Mi"
+                limits:
+                  cpu: "500m"
+                  memory: "1Gi"
+
+              volumeMounts:
+                - name: backup-storage
+                  mountPath: /backup
+                - name: tmp
+                  mountPath: /tmp
+
+              securityContext:
+                runAsNonRoot: true
+                runAsUser: 1000
+                allowPrivilegeEscalation: false
+
+          volumes:
+            - name: backup-storage
+              persistentVolumeClaim:
+                claimName: backup-pvc
+            - name: tmp
+              emptyDir: {}
+
+          serviceAccountName: backup-sa
+          terminationGracePeriodSeconds: 60
+
+---
+# ─────────────────────────────────────────────────────────────
+# COMMANDES KUBECTL
+# ─────────────────────────────────────────────────────────────
+#
+# Jobs:
+#   kubectl apply -f job.yaml
+#   kubectl get jobs
+#   kubectl describe job my-job
+#   kubectl logs job/my-job             # Logs du job
+#   kubectl logs -l job-name=my-job     # Logs par label
+#   kubectl wait --for=condition=complete job/my-job --timeout=300s
+#   kubectl delete job my-job
+#
+# CronJobs:
+#   kubectl apply -f cronjob.yaml
+#   kubectl get cronjobs
+#   kubectl get cj
+#   kubectl describe cronjob my-cronjob
+#
+# Déclencher manuellement un CronJob:
+#   kubectl create job --from=cronjob/my-cronjob manual-run-$(date +%s)
+#
+# Suspendre/reprendre:
+#   kubectl patch cronjob my-cronjob -p '{"spec":{"suspend":true}}'
+#   kubectl patch cronjob my-cronjob -p '{"spec":{"suspend":false}}'
+#
+# Voir les jobs créés par le CronJob:
+#   kubectl get jobs -l app=scheduled-task
+#
+# Vérifier le statut du dernier job:
+#   kubectl get cronjob my-cronjob -o jsonpath='{.status.lastScheduleTime}'

@@ -1,0 +1,223 @@
+# ============================================================
+# KUBERNETES DEPLOYMENT - CHEATSHEET COMPLET
+# ============================================================
+# Gère le déploiement et la mise à l'échelle de Pods via ReplicaSets.
+# Fournit: rolling updates, rollbacks, scaling.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-deployment
+  namespace: default
+  labels:
+    app: my-app
+    version: "1.0"
+  annotations:
+    deployment.kubernetes.io/revision: "1"
+    kubernetes.io/change-cause: "Initial deployment"  # Pour kubectl rollout history
+
+spec:
+  # ─── RÉPLIQUES ────────────────────────────────────────────
+  replicas: 3                           # Nombre de pods souhaité
+
+  # ─── SÉLECTEUR ────────────────────────────────────────────
+  # IMMUABLE après création - doit matcher spec.template.metadata.labels
+  selector:
+    matchLabels:
+      app: my-app
+    # matchExpressions:
+    #   - key: app
+    #     operator: In
+    #     values: ["my-app"]
+
+  # ─── STRATÉGIE DE MISE À JOUR ─────────────────────────────
+  strategy:
+    type: RollingUpdate                 # RollingUpdate | Recreate
+
+    rollingUpdate:                      # Seulement si type: RollingUpdate
+      maxUnavailable: 1                 # Max pods indisponibles (nombre ou %)
+      maxSurge: 1                       # Max pods supplémentaires (nombre ou %)
+      # maxUnavailable: "25%"           # 25% par défaut
+      # maxSurge: "25%"                 # 25% par défaut
+
+    # type: Recreate                    # Arrête tous les pods avant d'en créer
+    #                                   # (downtime mais utile pour volumes RWO)
+
+  # ─── POLITIQUE DE RÉVISION ────────────────────────────────
+  revisionHistoryLimit: 10             # Nb de ReplicaSets gardés pour rollback
+  progressDeadlineSeconds: 600        # Secondes avant échec du déploiement
+  minReadySeconds: 0                  # Secondes avant qu'un pod soit "prêt"
+                                       # (utile pour éviter rollout trop rapide)
+
+  # ─── TEMPLATE DU POD ──────────────────────────────────────
+  template:
+    metadata:
+      labels:                           # DOIT matcher spec.selector
+        app: my-app
+        version: "1.0"
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+
+    spec:
+      # Voir 01-pod.yaml pour toutes les options de spec
+
+      containers:
+        - name: app
+          image: my-app:1.0
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: metrics
+              containerPort: 9090
+
+          env:
+            - name: APP_ENV
+              value: "production"
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: db-secret
+                  key: password
+
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 3
+
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 10"]  # Graceful shutdown
+
+          volumeMounts:
+            - name: config
+              mountPath: /etc/app
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+
+      # Conteneur sidecar (logging, proxy, etc.)
+        - name: log-forwarder
+          image: fluent/fluent-bit:2.0
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "100m"
+              memory: "128Mi"
+          volumeMounts:
+            - name: logs
+              mountPath: /var/log/app
+
+      volumes:
+        - name: config
+          configMap:
+            name: app-config
+        - name: tmp
+          emptyDir: {}
+        - name: logs
+          emptyDir: {}
+
+      # ─── SCHEDULING ─────────────────────────────────────
+      affinity:
+        podAntiAffinity:                # Répartir les pods sur différents nœuds
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: my-app
+                topologyKey: kubernetes.io/hostname
+
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: my-app
+
+      # ─── SÉCURITÉ ───────────────────────────────────────
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 2000
+        seccompProfile:
+          type: RuntimeDefault
+
+      serviceAccountName: my-app-sa
+      automountServiceAccountToken: false
+
+      # ─── TOLÉRANCE AUX PANNES ───────────────────────────
+      terminationGracePeriodSeconds: 60
+
+      # ─── IMAGES PRIVÉES ─────────────────────────────────
+      imagePullSecrets:
+        - name: registry-secret
+
+---
+# ============================================================
+# COMMANDES KUBECTL POUR DEPLOYMENTS
+# ============================================================
+#
+# Créer/Appliquer:
+#   kubectl apply -f deployment.yaml
+#   kubectl create deployment my-app --image=nginx:1.25 --replicas=3
+#
+# Inspecter:
+#   kubectl get deployments
+#   kubectl get deploy -o wide
+#   kubectl describe deployment my-deployment
+#   kubectl get pods -l app=my-app
+#
+# Scaling:
+#   kubectl scale deployment my-deployment --replicas=5
+#   kubectl autoscale deployment my-deployment --min=2 --max=10 --cpu-percent=80
+#
+# Mise à jour de l'image:
+#   kubectl set image deployment/my-deployment app=my-app:2.0
+#   kubectl set env deployment/my-deployment APP_VERSION=2.0
+#
+# Rollout:
+#   kubectl rollout status deployment/my-deployment
+#   kubectl rollout history deployment/my-deployment
+#   kubectl rollout history deployment/my-deployment --revision=2
+#   kubectl rollout undo deployment/my-deployment
+#   kubectl rollout undo deployment/my-deployment --to-revision=2
+#   kubectl rollout pause deployment/my-deployment
+#   kubectl rollout resume deployment/my-deployment
+#   kubectl rollout restart deployment/my-deployment
+#
+# Supprimer:
+#   kubectl delete deployment my-deployment

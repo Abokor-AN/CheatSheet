@@ -1,0 +1,383 @@
+# ============================================================
+# KEDA - Kubernetes Event-Driven Autoscaling - CHEATSHEET
+# ============================================================
+# Étend le HPA pour scaler à partir de sources d'événements externes.
+# Scale de 0 à N et de N à 0 (contrairement au HPA standard).
+# Nécessite: installation de KEDA dans le cluster.
+#
+# Concepts:
+# - ScaledObject: lie un Deployment/StatefulSet à des triggers
+# - ScaledJob:    crée des Jobs à la demande selon des événements
+# - TriggerAuthentication: stocke les credentials pour les scalers
+# - ClusterTriggerAuthentication: comme TriggerAuthentication mais cluster-wide
+
+# ─────────────────────────────────────────────────────────────
+# TRIGGER AUTHENTICATION
+# ─────────────────────────────────────────────────────────────
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: aws-sqs-auth
+  namespace: production
+spec:
+  secretTargetRef:
+    - parameter: awsAccessKeyID
+      name: aws-credentials
+      key: access-key-id
+    - parameter: awsSecretAccessKey
+      name: aws-credentials
+      key: secret-access-key
+
+  # Depuis des variables d'environnement du pod KEDA
+  env:
+    - parameter: region
+      name: AWS_REGION
+      containerName: keda-operator
+
+  # Depuis un Secret Kubernetes
+  # secretTargetRef:
+  #   - parameter: connection
+  #     name: redis-secret
+  #     key: connectionString
+
+  # Workload Identity (AWS IRSA, GCP WI, Azure Workload Identity)
+  podIdentity:
+    provider: aws                     # aws | gcp | azure | azureWorkload | none
+
+  # Vault (HashiCorp)
+  # hashiCorpVault:
+  #   address: https://vault.example.com
+  #   role: keda-role
+  #   secrets:
+  #     - parameter: connection
+  #       path: secret/data/redis
+  #       key: connectionString
+
+---
+# ClusterTriggerAuthentication (partagé entre namespaces)
+apiVersion: keda.sh/v1alpha1
+kind: ClusterTriggerAuthentication
+metadata:
+  name: global-aws-auth
+spec:
+  podIdentity:
+    provider: aws
+
+---
+# ─────────────────────────────────────────────────────────────
+# SCALEDOBJECT - Scale un Deployment/StatefulSet
+# ─────────────────────────────────────────────────────────────
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: my-scaledobject
+  namespace: production
+
+spec:
+  # ── Cible ────────────────────────────────────────────────
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment                  # Deployment | StatefulSet | Custom
+    name: my-worker
+    envSourceContainerName: app       # Conteneur dont lire les env vars
+
+  # ── Scaling ──────────────────────────────────────────────
+  minReplicaCount: 0                  # 0 = scale to zero (pas possible avec HPA)
+  maxReplicaCount: 50
+  initialCooldownPeriod: 0           # Délai avant premier scale (secondes)
+  cooldownPeriod: 300                # Délai avant scale to zero (secondes)
+  idleReplicaCount: 0                # Répliques quand aucun événement
+
+  # ── Polling ──────────────────────────────────────────────
+  pollingInterval: 30                # Fréquence de vérification des triggers (secondes)
+
+  # ── Comportement (identique au HPA) ──────────────────────
+  advanced:
+    restoreToOriginalReplicaCount: true  # Restaure replicas originaux après suppression ScaledObject
+    horizontalPodAutoscalerConfig:
+      name: keda-hpa-my-worker          # Nom du HPA géré par KEDA
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+            - type: Percent
+              value: 25
+              periodSeconds: 60
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies:
+            - type: Percent
+              value: 100
+              periodSeconds: 30
+
+  # ── Triggers ─────────────────────────────────────────────
+  triggers:
+
+    # ── AWS SQS ────────────────────────────────────────────
+    - type: aws-sqs-queue
+      authenticationRef:
+        name: aws-sqs-auth
+        kind: TriggerAuthentication   # TriggerAuthentication | ClusterTriggerAuthentication
+      metadata:
+        queueURL: https://sqs.us-east-1.amazonaws.com/123456789/my-queue
+        queueLength: "5"              # Messages par pod
+        awsRegion: us-east-1
+        scaleOnInFlight: "true"       # Compter les messages en transit
+        scaleOnDelayed: "false"
+        identityOwner: pod            # pod | operator
+
+    # ── AWS Kinesis ─────────────────────────────────────────
+    - type: aws-kinesis-stream
+      authenticationRef:
+        name: aws-sqs-auth
+      metadata:
+        streamName: my-kinesis-stream
+        shardCount: "2"               # Répliques par shard
+        awsRegion: us-east-1
+        activationShardCount: "0"     # Shards minimum pour activer
+
+    # ── Kafka ───────────────────────────────────────────────
+    - type: kafka
+      metadata:
+        bootstrapServers: kafka-broker:9092
+        consumerGroup: my-consumer-group
+        topic: my-topic
+        lagThreshold: "100"           # Messages en retard par pod
+        offsetResetPolicy: latest     # latest | earliest
+        allowIdleConsumers: "false"
+        scaleToZeroOnInvalidOffset: "false"
+        partitionLimitation: "1,2,3"  # Partitions spécifiques
+
+    # ── RabbitMQ ────────────────────────────────────────────
+    - type: rabbitmq
+      authenticationRef:
+        name: rabbitmq-auth
+      metadata:
+        host: amqp://user:pass@rabbitmq:5672/
+        protocol: amqp                # amqp | http
+        queueName: my-queue
+        mode: QueueLength             # QueueLength | MessageRate
+        value: "20"                   # Messages par pod
+        activationValue: "0"
+
+    # ── Redis ───────────────────────────────────────────────
+    - type: redis
+      authenticationRef:
+        name: redis-auth
+      metadata:
+        address: redis:6379
+        listName: my-list
+        listLength: "10"              # Items par pod
+        activationListLength: "0"
+        enableTLS: "false"
+
+    # ── Redis Cluster ────────────────────────────────────────
+    - type: redis-cluster
+      metadata:
+        addresses: redis-cluster:6379
+        listName: my-list
+        listLength: "10"
+
+    # ── Redis Streams ────────────────────────────────────────
+    - type: redis-streams
+      metadata:
+        address: redis:6379
+        stream: my-stream
+        consumerGroup: my-group
+        pendingEntriesCount: "5"
+
+    # ── PostgreSQL ──────────────────────────────────────────
+    - type: postgresql
+      authenticationRef:
+        name: pg-auth
+      metadata:
+        query: "SELECT count(*) FROM pending_jobs WHERE status='pending'"
+        targetQueryValue: "10"        # Jobs par pod
+        activationTargetQueryValue: "0"
+        dbName: mydb
+        sslmode: disable
+
+    # ── MySQL ────────────────────────────────────────────────
+    - type: mysql
+      authenticationRef:
+        name: mysql-auth
+      metadata:
+        query: "SELECT count(*) FROM jobs WHERE processed=0"
+        queryValue: "5"
+
+    # ── MongoDB ──────────────────────────────────────────────
+    - type: mongodb
+      authenticationRef:
+        name: mongo-auth
+      metadata:
+        collection: jobs
+        query: '{"status":"pending"}'
+        queryValue: "10"
+        dbName: mydb
+
+    # ── Prometheus ──────────────────────────────────────────
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus:9090
+        query: sum(rate(http_requests_total{job="my-app"}[2m]))
+        threshold: "100"              # Requêtes/s par pod
+        activationThreshold: "0"
+        queryParameters:
+          custom: param
+
+    # ── Cron (scale up/down selon horaire) ──────────────────
+    - type: cron
+      metadata:
+        timezone: Europe/Paris
+        start: 30 6 * * 1-5           # Lundi-vendredi 6h30: scale up
+        end: 30 18 * * 1-5            # Lundi-vendredi 18h30: scale down
+        desiredReplicas: "10"
+
+    # ── CPU (comme HPA) ─────────────────────────────────────
+    - type: cpu
+      metricType: Utilization         # Utilization | AverageValue
+      metadata:
+        value: "70"                   # 70% CPU
+
+    # ── Memory ──────────────────────────────────────────────
+    - type: memory
+      metricType: Utilization
+      metadata:
+        value: "80"
+
+    # ── Kubernetes External (métriques personnalisées) ───────
+    - type: kubernetes-workload
+      metadata:
+        podSelector: "app=my-producer"  # Scale en fonction du nombre de pods d'un autre déploiement
+        value: "2"                      # Ratio: 2 consumers par 1 producer
+
+    # ── HTTP (scale to zero HTTP) ────────────────────────────
+    # Nécessite http-add-on KEDA
+    - type: http
+      metadata:
+        hosts:
+          - app.example.com
+        port: "8080"
+        targetPendingRequests: "100"
+
+    # ── Azure Service Bus ───────────────────────────────────
+    - type: azure-servicebus
+      authenticationRef:
+        name: azure-sb-auth
+      metadata:
+        queueName: my-queue
+        namespace: my-servicebus-namespace
+        messageCount: "5"
+
+    # ── Azure Event Hubs ────────────────────────────────────
+    - type: azure-eventhub
+      metadata:
+        consumerGroup: my-group
+        unprocessedEventThreshold: "64"
+        blobContainer: offsets-container
+        checkpointStrategy: blobMetadata
+
+    # ── GCP Pub/Sub ─────────────────────────────────────────
+    - type: gcp-pubsub
+      authenticationRef:
+        name: gcp-auth
+      metadata:
+        subscriptionName: projects/myproject/subscriptions/my-sub
+        value: "5"
+        activationValue: "0"
+
+---
+# ─────────────────────────────────────────────────────────────
+# SCALEDJOB - Crée des Jobs K8s à la demande
+# ─────────────────────────────────────────────────────────────
+apiVersion: keda.sh/v1alpha1
+kind: ScaledJob
+metadata:
+  name: my-scaled-job
+  namespace: production
+
+spec:
+  jobTargetRef:
+    parallelism: 1                    # Pods parallèles par Job
+    completions: 1
+    activeDeadlineSeconds: 600
+    backoffLimit: 3
+    template:
+      spec:
+        restartPolicy: Never
+        containers:
+          - name: worker
+            image: my-worker:1.0
+            env:
+              - name: QUEUE_URL
+                value: "https://sqs.us-east-1.amazonaws.com/123456789/my-queue"
+            resources:
+              requests:
+                cpu: "500m"
+                memory: "256Mi"
+              limits:
+                cpu: "2"
+                memory: "1Gi"
+
+  # ── Scaling ──────────────────────────────────────────────
+  pollingInterval: 30
+  minReplicaCount: 0
+  maxReplicaCount: 50
+
+  # Nombre de messages traités par job
+  scalingStrategy:
+    strategy: default                 # default | custom | accurate
+    customScalingQueueLengthDeduction: 1
+    customScalingRunningJobPercentage: "0.5"
+    pendingJobsCount: 1               # Jobs en attente max
+
+  # ── Trigger (SQS) ────────────────────────────────────────
+  triggers:
+    - type: aws-sqs-queue
+      authenticationRef:
+        name: aws-sqs-auth
+      metadata:
+        queueURL: https://sqs.us-east-1.amazonaws.com/123456789/my-jobs-queue
+        queueLength: "1"              # 1 message = 1 job
+        awsRegion: us-east-1
+
+  # ── Gestion des jobs terminés ─────────────────────────────
+  successfulJobsHistoryLimit: 5
+  failedJobsHistoryLimit: 5
+  rollout:
+    strategy: gradual                 # gradual | default
+    propagationPolicy: foreground
+
+---
+# ─────────────────────────────────────────────────────────────
+# COMMANDES KUBECTL
+# ─────────────────────────────────────────────────────────────
+#
+# Installation (Helm):
+#   helm repo add kedacore https://kedacore.github.io/charts
+#   helm repo update
+#   helm install keda kedacore/keda --namespace keda --create-namespace
+#
+# kubectl get scaledobjects -A
+# kubectl get scaledjobs -A
+# kubectl describe scaledobject my-scaledobject -n production
+#
+# Voir le HPA géré par KEDA:
+#   kubectl get hpa -n production
+#
+# Statut du ScaledObject:
+#   kubectl get scaledobject my-scaledobject \
+#     -o jsonpath='{.status.conditions}'
+#
+# Trigger authentications:
+#   kubectl get triggerauthentications -A
+#   kubectl get clustertriggerauthentications
+#
+# Logs KEDA:
+#   kubectl logs -n keda -l app=keda-operator -f
+#   kubectl logs -n keda -l app=keda-metrics-apiserver -f
+#
+# Debug:
+#   kubectl describe scaledobject my-scaledobject
+#   # Chercher: "READY: True", "ACTIVE: True/False"
+#   # False ACTIVE = 0 messages/événements = scale to zero

@@ -1,0 +1,229 @@
+# ============================================================
+# KUBERNETES INGRESS - CHEATSHEET COMPLET
+# ============================================================
+# Gère l'accès HTTP/HTTPS externe vers les services du cluster.
+# Nécessite un Ingress Controller (nginx, traefik, istio, etc.)
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-ingress
+  namespace: default
+  labels:
+    app: my-app
+
+  # ─── ANNOTATIONS (varient selon le contrôleur) ────────────
+  annotations:
+    # ── Nginx Ingress Controller ──
+    kubernetes.io/ingress.class: "nginx"              # Ancienne méthode (déprécié)
+    nginx.ingress.kubernetes.io/rewrite-target: /     # Réécriture d'URL
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"  # Forcer HTTPS
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "60"
+    nginx.ingress.kubernetes.io/client-body-buffer-size: "1m"
+    nginx.ingress.kubernetes.io/proxy-buffer-size: "128k"
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      more_set_headers "X-Frame-Options: DENY";
+    nginx.ingress.kubernetes.io/server-snippet: |
+      location /blocked { return 403; }
+
+    # ── Rate Limiting ──
+    nginx.ingress.kubernetes.io/limit-rps: "10"
+    nginx.ingress.kubernetes.io/limit-connections: "5"
+
+    # ── CORS ──
+    nginx.ingress.kubernetes.io/enable-cors: "true"
+    nginx.ingress.kubernetes.io/cors-allow-origin: "https://example.com"
+    nginx.ingress.kubernetes.io/cors-allow-methods: "GET, PUT, POST, DELETE, OPTIONS"
+    nginx.ingress.kubernetes.io/cors-allow-headers: "Authorization, Content-Type"
+
+    # ── Auth Basic ──
+    nginx.ingress.kubernetes.io/auth-type: basic
+    nginx.ingress.kubernetes.io/auth-secret: basic-auth
+    nginx.ingress.kubernetes.io/auth-realm: "Authentication Required"
+
+    # ── Whitelist IP ──
+    nginx.ingress.kubernetes.io/whitelist-source-range: "10.0.0.0/8,192.168.0.0/16"
+
+    # ── Sticky Sessions ──
+    nginx.ingress.kubernetes.io/affinity: "cookie"
+    nginx.ingress.kubernetes.io/session-cookie-name: "INGRESSCOOKIE"
+    nginx.ingress.kubernetes.io/session-cookie-max-age: "172800"
+
+    # ── Load Balancing ──
+    nginx.ingress.kubernetes.io/load-balance: "round_robin"  # round_robin | least_conn | ip_hash
+
+    # ── Timeouts ──
+    nginx.ingress.kubernetes.io/upstream-keepalive-timeout: "60"
+
+    # ── Cert-Manager (TLS automatique) ──
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    cert-manager.io/issuer: "my-issuer"
+
+spec:
+  # ─── INGRESS CLASS ────────────────────────────────────────
+  ingressClassName: nginx               # Référence à IngressClass (remplace annotation)
+
+  # ─── TLS ──────────────────────────────────────────────────
+  tls:
+    - hosts:
+        - example.com
+        - www.example.com
+      secretName: example-tls           # Secret de type kubernetes.io/tls
+    - hosts:
+        - api.example.com
+      secretName: api-example-tls
+
+  # ─── RÈGLES DE ROUTAGE ────────────────────────────────────
+  rules:
+    # Routage par hostname
+    - host: example.com
+      http:
+        paths:
+          # Path exact
+          - path: /api/v1/users
+            pathType: Exact             # Exact | Prefix | ImplementationSpecific
+            backend:
+              service:
+                name: users-service
+                port:
+                  number: 80
+                  # name: http          # Référence par nom de port
+
+          # Path par préfixe
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: api-service
+                port:
+                  number: 8080
+
+          # Chemin racine (catch-all)
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend-service
+                port:
+                  number: 80
+
+    # Autre hostname
+    - host: api.example.com
+      http:
+        paths:
+          - path: /v1
+            pathType: Prefix
+            backend:
+              service:
+                name: api-v1-service
+                port:
+                  number: 8080
+          - path: /v2
+            pathType: Prefix
+            backend:
+              service:
+                name: api-v2-service
+                port:
+                  number: 8080
+
+    # Wildcard hostname
+    - host: "*.example.com"
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: wildcard-service
+                port:
+                  number: 80
+
+    # Sans hostname (match tout)
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: default-backend
+                port:
+                  number: 80
+
+  # ─── BACKEND PAR DÉFAUT ───────────────────────────────────
+  defaultBackend:
+    service:
+      name: default-backend-service
+    port:
+      number: 80
+    # resource:                         # Ou une ressource personnalisée
+    #   apiGroup: k8s.example.com
+    #   kind: StorageBucket
+    #   name: static-assets
+
+---
+# ─────────────────────────────────────────────────────────────
+# INGRESSCLASS
+# ─────────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: nginx
+  annotations:
+    ingressclass.kubernetes.io/is-default-class: "true"  # Classe par défaut
+spec:
+  controller: k8s.io/ingress-nginx
+  parameters:                           # Paramètres spécifiques au contrôleur
+    apiGroup: k8s.example.com
+    kind: IngressParameters
+    name: external-lb
+
+---
+# ─────────────────────────────────────────────────────────────
+# EXEMPLES COURANTS
+# ─────────────────────────────────────────────────────────────
+
+# Ingress simple avec TLS automatique (cert-manager)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: simple-tls-ingress
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [app.example.com]
+      secretName: app-tls
+  rules:
+    - host: app.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: my-app-service
+                port:
+                  number: 80
+
+---
+# ─────────────────────────────────────────────────────────────
+# COMMANDES KUBECTL
+# ─────────────────────────────────────────────────────────────
+#
+# kubectl apply -f ingress.yaml
+# kubectl get ingress
+# kubectl get ing -o wide
+# kubectl describe ingress my-ingress
+# kubectl delete ingress my-ingress
+#
+# Test local avec /etc/hosts:
+# echo "$(minikube ip) example.com" | sudo tee -a /etc/hosts
+#
+# Voir les logs du contrôleur:
+# kubectl logs -n ingress-nginx -l app.kubernetes.io/name=ingress-nginx

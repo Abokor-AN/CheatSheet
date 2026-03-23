@@ -1,0 +1,201 @@
+# ============================================================
+# KUBERNETES SERVICE - CHEATSHEET COMPLET
+# ============================================================
+# Expose des pods via une IP stable et un DNS.
+# Types: ClusterIP, NodePort, LoadBalancer, ExternalName
+
+# ─────────────────────────────────────────────────────────────
+# TYPE 1: ClusterIP (défaut) - accès interne au cluster uniquement
+# ─────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-clusterip-service
+  namespace: default
+  labels:
+    app: my-app
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"  # Annotation spécifique cloud
+
+spec:
+  type: ClusterIP                       # ClusterIP | NodePort | LoadBalancer | ExternalName
+
+  selector:                             # Sélectionne les pods cibles
+    app: my-app
+    version: "1.0"
+
+  ports:
+    - name: http                        # Nom du port (requis si plusieurs ports)
+      protocol: TCP                     # TCP | UDP | SCTP
+      port: 80                          # Port du Service (accessible par les clients)
+      targetPort: 8080                  # Port du conteneur (ou nom du port)
+      # targetPort: http                # Référence par nom (défini dans containerPort)
+    - name: https
+      protocol: TCP
+      port: 443
+      targetPort: 8443
+    - name: grpc
+      protocol: TCP
+      port: 9090
+      targetPort: 9090
+
+  clusterIP: ""                         # Auto-assigné | "None" (Headless) | IP spécifique
+  clusterIPs: []                        # IPv4 et/ou IPv6
+  ipFamilies: [IPv4]                    # IPv4 | IPv6
+  ipFamilyPolicy: SingleStack           # SingleStack | PreferDualStack | RequireDualStack
+
+  sessionAffinity: None                 # None | ClientIP (sticky sessions)
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 10800             # 3h par défaut (300s-86400s)
+
+  publishNotReadyAddresses: false       # Inclure pods non-prêts dans Endpoints
+
+  # internalTrafficPolicy: Cluster      # Cluster | Local (routage intra-nœud)
+
+---
+# ─────────────────────────────────────────────────────────────
+# TYPE 2: Headless Service - DNS par pod, sans ClusterIP
+# ─────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-headless-service
+spec:
+  clusterIP: None                       # "None" = Headless
+  selector:
+    app: my-stateful-app
+  ports:
+    - port: 80
+      targetPort: 8080
+  # DNS retourne les IPs de tous les pods (utile pour StatefulSets)
+
+---
+# ─────────────────────────────────────────────────────────────
+# TYPE 3: NodePort - expose sur chaque nœud du cluster
+# ─────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-nodeport-service
+spec:
+  type: NodePort
+  selector:
+    app: my-app
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80                          # ClusterIP port
+      targetPort: 8080                  # Pod port
+      nodePort: 30080                   # Port sur chaque nœud (30000-32767)
+                                        # Auto-assigné si omis
+
+  externalTrafficPolicy: Cluster        # Cluster | Local
+  # Cluster: distribue sur tous les pods (peut changer le source IP)
+  # Local: reste sur le nœud (préserve source IP, peut déséquilibrer)
+
+---
+# ─────────────────────────────────────────────────────────────
+# TYPE 4: LoadBalancer - crée un load balancer cloud
+# ─────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-loadbalancer-service
+  annotations:
+    # AWS
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    service.beta.kubernetes.io/aws-load-balancer-internal: "true"
+    service.beta.kubernetes.io/aws-load-balancer-ssl-cert: "arn:aws:acm:..."
+    # GCP
+    cloud.google.com/load-balancer-type: "Internal"
+    # Azure
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+spec:
+  type: LoadBalancer
+  selector:
+    app: my-app
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+    - name: https
+      port: 443
+      targetPort: 8443
+
+  loadBalancerIP: "203.0.113.100"       # IP statique (si supporté par le cloud)
+  loadBalancerSourceRanges:             # Firewall: IPs autorisées
+    - "10.0.0.0/8"
+    - "192.168.0.0/16"
+  loadBalancerClass: "internal-lb"      # Classe de LB (K8s 1.22+)
+
+  externalTrafficPolicy: Local          # Préserver IP source avec LB
+  healthCheckNodePort: 31000            # Port healthcheck (si externalTrafficPolicy: Local)
+
+  allocateLoadBalancerNodePorts: true   # Allouer NodePorts pour LB (défaut: true)
+
+---
+# ─────────────────────────────────────────────────────────────
+# TYPE 5: ExternalName - alias DNS vers service externe
+# ─────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-external-service
+spec:
+  type: ExternalName
+  externalName: database.example.com   # FQDN externe (résolu par CNAME)
+  # Pas de selector, pas de ports (optionnel)
+  ports:
+    - port: 5432
+
+---
+# ─────────────────────────────────────────────────────────────
+# SERVICE AVEC ENDPOINTS MANUELS (sans selector)
+# ─────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-manual-service
+spec:
+  ports:
+    - port: 5432
+      targetPort: 5432
+  # Pas de selector = endpoints manuels
+---
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: my-manual-service              # Même nom que le Service
+subsets:
+  - addresses:
+      - ip: 192.168.1.100
+      - ip: 192.168.1.101
+    ports:
+      - port: 5432
+
+---
+# ─────────────────────────────────────────────────────────────
+# COMMANDES KUBECTL POUR SERVICES
+# ─────────────────────────────────────────────────────────────
+#
+# Créer:
+#   kubectl apply -f service.yaml
+#   kubectl expose deployment my-app --port=80 --target-port=8080 --type=ClusterIP
+#   kubectl expose pod my-pod --port=80 --name=my-service
+#
+# Inspecter:
+#   kubectl get services
+#   kubectl get svc -o wide
+#   kubectl describe service my-service
+#   kubectl get endpoints my-service
+#
+# Test de connectivité:
+#   kubectl run test --image=busybox --rm -it -- wget -qO- http://my-service
+#   kubectl port-forward service/my-service 8080:80
+#
+# DNS (format):
+#   <service>.<namespace>.svc.cluster.local
+#   my-service.default.svc.cluster.local
+#   my-service.default  (raccourci depuis le même namespace)
+#   my-service          (raccourci depuis le même namespace)

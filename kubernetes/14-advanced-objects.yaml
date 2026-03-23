@@ -1,0 +1,363 @@
+# ============================================================
+# KUBERNETES OBJETS AVANCÉS - CHEATSHEET COMPLET
+# ============================================================
+# RuntimeClass, PodSecurityAdmission, MutatingWebhook,
+# ValidatingWebhook, CustomResourceDefinition (CRD)
+
+# ─────────────────────────────────────────────────────────────
+# RUNTIMECLASS
+# ─────────────────────────────────────────────────────────────
+# Sélectionne le runtime de conteneur (runc, gVisor, Kata Containers, etc.)
+
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: gvisor
+handler: runsc                        # Handler du runtime (défini sur les nœuds)
+overhead:                             # Ressources overhead du runtime
+  podFixed:
+    cpu: "250m"
+    memory: "64Mi"
+scheduling:                           # Contraintes de scheduling
+  nodeSelector:
+    sandbox.gke.io/runtime: gvisor
+  tolerations:
+    - key: sandbox.gke.io/runtime
+      operator: Equal
+      value: gvisor
+      effect: NoSchedule
+
+---
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: kata-containers
+handler: kata
+overhead:
+  podFixed:
+    cpu: "500m"
+    memory: "128Mi"
+
+---
+# Utilisation dans un Pod
+# spec:
+#   runtimeClassName: gvisor
+
+---
+# ─────────────────────────────────────────────────────────────
+# POD SECURITY ADMISSION (PSA) - K8s 1.25+ (remplace PSP)
+# ─────────────────────────────────────────────────────────────
+# Configuré via des labels sur les namespaces.
+# Niveaux: privileged | baseline | restricted
+
+# Labels PSA sur un namespace:
+# pod-security.kubernetes.io/enforce: restricted    # Bloque les violations
+# pod-security.kubernetes.io/warn: restricted       # Avertit (admission réussit)
+# pod-security.kubernetes.io/audit: restricted      # Log en audit
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: secure-namespace
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: v1.28
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+
+# Profile "restricted" exige sur les pods:
+# - runAsNonRoot: true
+# - seccompProfile: RuntimeDefault ou Localhost
+# - allowPrivilegeEscalation: false
+# - capabilities.drop: [ALL]
+# - volumes: limités (pas de hostPath)
+
+---
+# ─────────────────────────────────────────────────────────────
+# WEBHOOK CONFIGURATIONS
+# ─────────────────────────────────────────────────────────────
+
+# MutatingAdmissionWebhook: modifie les ressources à la création/mise à jour
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: my-mutating-webhook
+  labels:
+    app: my-webhook
+
+webhooks:
+  - name: my-webhook.example.com      # FQDN unique (requis)
+    admissionReviewVersions: ["v1", "v1beta1"]
+    sideEffects: None                 # None | NoneOnDryRun | Some | Unknown
+
+    # Quand appeler le webhook
+    rules:
+      - apiGroups: ["apps"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]  # CREATE | UPDATE | DELETE | CONNECT | *
+        resources: ["deployments"]
+        scope: "Namespaced"           # Namespaced | Cluster | *
+
+    # Service du webhook
+    clientConfig:
+      service:
+        name: my-webhook-service
+        namespace: webhook-system
+        path: "/mutate"
+        port: 443
+      caBundle: <base64-encoded-CA>   # CA pour vérifier le cert TLS du webhook
+      # url: https://my-webhook.example.com/mutate  # Alternative au service
+
+    # Politique en cas d'échec du webhook
+    failurePolicy: Fail               # Fail | Ignore
+
+    # Timeout
+    timeoutSeconds: 10               # 1-30 secondes
+
+    # Sélectionner les namespaces
+    namespaceSelector:
+      matchLabels:
+        webhook: enabled
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values: [kube-system, kube-public]
+
+    # Sélectionner les objets
+    objectSelector:
+      matchLabels:
+        mutate: "true"
+
+    # Gestion des dry-run
+    reinvocationPolicy: Never         # Never | IfNeeded
+
+    # Conditions de correspondance (K8s 1.28+)
+    matchConditions:
+      - name: "not-system-namespace"
+        expression: "object.metadata.namespace != 'kube-system'"
+
+---
+# ValidatingAdmissionWebhook: valide les ressources (peut refuser)
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: my-validating-webhook
+
+webhooks:
+  - name: validate.example.com
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["pods"]
+        scope: "Namespaced"
+    clientConfig:
+      service:
+        name: my-validator
+        namespace: webhook-system
+        path: "/validate"
+        port: 443
+      caBundle: <base64-encoded-CA>
+    failurePolicy: Fail
+    timeoutSeconds: 5
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values: [kube-system]
+
+---
+# ─────────────────────────────────────────────────────────────
+# CUSTOM RESOURCE DEFINITION (CRD)
+# ─────────────────────────────────────────────────────────────
+# Étend l'API Kubernetes avec des types personnalisés.
+
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: applications.mycompany.com    # Format: <plural>.<group>
+
+spec:
+  group: mycompany.com                # API group
+  names:
+    plural: applications              # Nom pluriel (URLs)
+    singular: application             # Nom singulier
+    kind: Application                 # Type CamelCase
+    shortNames: [app, apps]           # Raccourcis kubectl
+    listKind: ApplicationList         # Type de liste
+    categories: [all]                 # Inclure dans 'kubectl get all'
+
+  scope: Namespaced                   # Namespaced | Cluster
+
+  versions:
+    - name: v1                        # Version de l'API
+      served: true                    # Cette version est servie
+      storage: true                   # Version de stockage (une seule)
+      deprecated: false               # Marquer comme déprécié
+      # deprecationWarning: "Use v2 instead"
+
+      # Colonnes additionnelles dans kubectl get
+      additionalPrinterColumns:
+        - name: Status
+          type: string
+          jsonPath: .status.phase
+          description: "Current status"
+        - name: Replicas
+          type: integer
+          jsonPath: .spec.replicas
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+
+      # Schéma de validation (OpenAPI v3)
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [image, replicas]
+              properties:
+                image:
+                  type: string
+                  description: "Docker image"
+                replicas:
+                  type: integer
+                  minimum: 1
+                  maximum: 100
+                  default: 1
+                env:
+                  type: array
+                  items:
+                    type: object
+                    required: [name, value]
+                    properties:
+                      name:
+                        type: string
+                      value:
+                        type: string
+                resources:
+                  type: object
+                  properties:
+                    cpu:
+                      type: string
+                      pattern: '^[0-9]+m?$'
+                    memory:
+                      type: string
+                config:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true  # Champs libres
+
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                  enum: [Pending, Running, Failed, Succeeded]
+                replicas:
+                  type: integer
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
+                      reason:
+                        type: string
+                      message:
+                        type: string
+
+      # Sous-ressources
+      subresources:
+        status: {}                    # Activer /status sous-ressource
+        scale:                        # Activer /scale sous-ressource
+          specReplicasPath: .spec.replicas
+          statusReplicasPath: .status.replicas
+          labelSelectorPath: .status.labelSelector
+
+    # Version v2 (migration de v1 vers v2)
+    - name: v2
+      served: true
+      storage: false                  # v1 reste le stockage
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                image:
+                  type: string
+                count:                # Renommé depuis "replicas"
+                  type: integer
+
+  # Conversion entre versions
+  conversion:
+    strategy: Webhook                 # None | Webhook
+    webhook:
+      conversionReviewVersions: ["v1"]
+      clientConfig:
+        service:
+          name: my-conversion-webhook
+          namespace: webhook-system
+          path: /convert
+
+  # Préservation de champs inconnus
+  preserveUnknownFields: false        # false requis pour validation OpenAPI
+
+---
+# Utilisation du CRD
+apiVersion: mycompany.com/v1
+kind: Application
+metadata:
+  name: my-custom-app
+  namespace: production
+spec:
+  image: nginx:1.25
+  replicas: 3
+  env:
+    - name: APP_ENV
+      value: production
+  resources:
+    cpu: "500m"
+    memory: "256Mi"
+
+---
+# ─────────────────────────────────────────────────────────────
+# COMMANDES KUBECTL
+# ─────────────────────────────────────────────────────────────
+#
+# CRD:
+#   kubectl get crd
+#   kubectl describe crd applications.mycompany.com
+#   kubectl get applications                    # Utiliser le CRD
+#   kubectl get applications -n production
+#   kubectl get app my-custom-app               # Avec shortname
+#   kubectl explain application.spec            # Documentation du schéma
+#
+# Webhooks:
+#   kubectl get mutatingwebhookconfigurations
+#   kubectl get validatingwebhookconfigurations
+#   kubectl describe mutatingwebhookconfiguration my-mutating-webhook
+#
+# RuntimeClass:
+#   kubectl get runtimeclass
+#   kubectl describe runtimeclass gvisor
+#
+# PSA - Tester les politiques:
+#   kubectl label namespace my-ns pod-security.kubernetes.io/enforce=restricted
+#   kubectl label namespace my-ns pod-security.kubernetes.io/warn=restricted
+#
+# Debug d'admission:
+#   kubectl --dry-run=server apply -f pod.yaml  # Tester sans créer
+#   kubectl apply --dry-run=server -f pod.yaml  # Même chose

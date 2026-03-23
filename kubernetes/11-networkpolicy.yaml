@@ -1,0 +1,339 @@
+# ============================================================
+# KUBERNETES NETWORKPOLICY - CHEATSHEET COMPLET
+# ============================================================
+# Contrôle le trafic réseau entre pods.
+# Nécessite un CNI supportant les NetworkPolicies (Calico, Cilium, Weave, etc.)
+# ATTENTION: sans NetworkPolicy, tout trafic est autorisé par défaut.
+
+# ─────────────────────────────────────────────────────────────
+# POLITIQUE PAR DÉFAUT: TOUT BLOQUER (best practice)
+# ─────────────────────────────────────────────────────────────
+
+# Bloquer tout trafic ENTRANT dans un namespace
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-all-ingress
+  namespace: production
+spec:
+  podSelector: {}                       # Sélectionne TOUS les pods du namespace
+  policyTypes:
+    - Ingress
+
+---
+# Bloquer tout trafic SORTANT d'un namespace
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-all-egress
+  namespace: production
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+
+---
+# Bloquer tout trafic (entrant ET sortant)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-all
+  namespace: production
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+  # Pas de règles = tout est bloqué
+
+---
+# ─────────────────────────────────────────────────────────────
+# AUTORISER TOUT LE TRAFIC (annuler restrictions)
+# ─────────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-all-ingress
+  namespace: development
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+  ingress:
+    - {}                              # Règle vide = tout autoriser
+
+---
+# ─────────────────────────────────────────────────────────────
+# EXEMPLE COMPLET: Application 3 tiers
+# ─────────────────────────────────────────────────────────────
+
+# Frontend: accepte trafic externe (Ingress Controller)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: frontend-netpol
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      tier: frontend
+
+  policyTypes:
+    - Ingress
+    - Egress
+
+  ingress:
+    # Autoriser depuis l'Ingress Controller
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8080
+
+    # Autoriser depuis un namespace spécifique
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              environment: production
+      ports:
+        - protocol: TCP
+          port: 8080
+          endPort: 8090                 # Plage de ports (K8s 1.22+)
+
+  egress:
+    # Autoriser vers le backend
+    - to:
+        - podSelector:
+            matchLabels:
+              tier: backend
+      ports:
+        - protocol: TCP
+          port: 8080
+
+    # Autoriser DNS (obligatoire si DNS est nécessaire)
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+---
+# Backend: accepte seulement depuis frontend
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: backend-netpol
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      tier: backend
+
+  policyTypes:
+    - Ingress
+    - Egress
+
+  ingress:
+    # Seulement depuis le frontend (même namespace)
+    - from:
+        - podSelector:
+            matchLabels:
+              tier: frontend
+      ports:
+        - protocol: TCP
+          port: 8080
+
+    # Seulement depuis le frontend (plusieurs namespaces)
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              environment: production
+          podSelector:                  # AND: namespace ET pod doivent matcher
+            matchLabels:
+              tier: frontend
+      ports:
+        - protocol: TCP
+          port: 8080
+
+  egress:
+    # Vers la base de données
+    - to:
+        - podSelector:
+            matchLabels:
+              tier: database
+      ports:
+        - protocol: TCP
+          port: 5432
+
+    # Vers un service externe (IP spécifique)
+    - to:
+        - ipBlock:
+            cidr: 203.0.113.0/24       # Range IP externe
+            except:
+              - 203.0.113.50/32        # Exclure une IP de la range
+      ports:
+        - protocol: TCP
+          port: 443
+
+    # DNS
+    - to: []
+      ports:
+        - protocol: UDP
+          port: 53
+
+---
+# Database: accepte seulement depuis backend
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: database-netpol
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      tier: database
+
+  policyTypes:
+    - Ingress
+    - Egress
+
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              tier: backend
+      ports:
+        - protocol: TCP
+          port: 5432
+
+  egress: []                            # Aucune sortie autorisée
+
+---
+# ─────────────────────────────────────────────────────────────
+# CAS D'USAGE: Autoriser monitoring
+# ─────────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-prometheus-scraping
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      prometheus.io/scrape: "true"
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app: prometheus
+      ports:
+        - protocol: TCP
+          port: 9090
+        - protocol: TCP
+          port: 9100
+        - protocol: TCP
+          port: 8080
+
+---
+# ─────────────────────────────────────────────────────────────
+# CAS D'USAGE: Isolation de namespaces
+# ─────────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: namespace-isolation
+  namespace: team-a
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Autoriser seulement depuis le même namespace
+    - from:
+        - podSelector: {}
+  egress:
+    # Autoriser vers le même namespace + DNS + kube-apiserver
+    - to:
+        - podSelector: {}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443                     # kube-apiserver
+
+---
+# ─────────────────────────────────────────────────────────────
+# OPÉRATEURS LOGIQUES: AND vs OR
+# ─────────────────────────────────────────────────────────────
+# IMPORTANT: La logique dépend de la syntaxe YAML
+
+# OR: éléments dans un tableau de "from"
+# (pod de namespace-a OU pod avec label app=frontend)
+# ingress:
+#   - from:
+#       - namespaceSelector:
+#           matchLabels:
+#             team: a
+#       - podSelector:              # <- OR (élément séparé)
+#           matchLabels:
+#             app: frontend
+
+# AND: namespaceSelector + podSelector dans le même élément
+# (pod avec label app=frontend ET dans namespace team-a)
+# ingress:
+#   - from:
+#       - namespaceSelector:         # \
+#           matchLabels:             #  AND (même élément)
+#             team: a                # /
+#         podSelector:
+#           matchLabels:
+#             app: frontend
+
+---
+# ─────────────────────────────────────────────────────────────
+# COMMANDES KUBECTL
+# ─────────────────────────────────────────────────────────────
+#
+# kubectl apply -f networkpolicy.yaml
+# kubectl get networkpolicies
+# kubectl get netpol
+# kubectl get netpol -n production
+# kubectl describe networkpolicy frontend-netpol
+#
+# Vérifier la connectivité:
+#   kubectl run test --image=busybox --rm -it -- wget -qO- http://backend-service
+#
+# Debug avec un pod temporaire:
+#   kubectl run netshoot --image=nicolaka/netshoot --rm -it -- bash
+#   # Puis: nc -zv backend-service 8080
+#
+# Voir les NetworkPolicies qui affectent un pod:
+#   kubectl get netpol -o yaml | grep -A5 podSelector

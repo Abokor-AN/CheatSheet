@@ -1,0 +1,291 @@
+# ============================================================
+# KUBERNETES HPA, VPA, PDB - CHEATSHEET COMPLET
+# ============================================================
+
+# ─────────────────────────────────────────────────────────────
+# HPA - HorizontalPodAutoscaler
+# ─────────────────────────────────────────────────────────────
+# Ajuste automatiquement le nombre de pods selon des métriques.
+# Nécessite: metrics-server (pour CPU/Mémoire), Prometheus Adapter (custom metrics)
+
+# HPA v2 (K8s 1.23+ - recommandé)
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: my-hpa
+  namespace: default
+
+spec:
+  # ── Cible du scaling ────────────────────────────────────
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment                  # Deployment | ReplicaSet | StatefulSet
+    name: my-deployment
+
+  # ── Limites de répliques ─────────────────────────────────
+  minReplicas: 2                      # Minimum (défaut: 1)
+  maxReplicas: 20                     # Maximum
+
+  # ── Métriques déclenchant le scaling ─────────────────────
+  metrics:
+    # Métrique CPU (Resource metric)
+    - type: Resource                  # Resource | Pods | Object | External | ContainerResource
+      resource:
+        name: cpu
+        target:
+          type: Utilization           # Utilization | AverageValue | Value
+          averageUtilization: 70      # 70% de la request CPU → scale up
+
+    # Métrique Mémoire
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: AverageValue
+          averageValue: 512Mi         # 512Mi par pod en moyenne
+
+    # Métrique par conteneur (K8s 1.20+)
+    - type: ContainerResource
+      containerResource:
+        name: cpu
+        container: app
+        target:
+          type: Utilization
+          averageUtilization: 80
+
+    # Métrique de pods (custom metric par pod)
+    - type: Pods
+      pods:
+        metric:
+          name: packets-per-second    # Metric exposée via Prometheus Adapter
+          selector:
+            matchLabels:
+              app: my-app
+        target:
+          type: AverageValue
+          averageValue: 1000          # 1000 packets/s par pod
+
+    # Métrique d'objet K8s
+    - type: Object
+      object:
+        metric:
+          name: requests-per-second
+        describedObject:
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          name: my-ingress
+        target:
+          type: Value
+          value: 10000                # 10000 req/s sur l'ingress total
+
+    # Métrique externe (hors cluster, ex: SQS queue length)
+    - type: External
+      external:
+        metric:
+          name: sqs_queue_length
+          selector:
+            matchLabels:
+              queue: my-worker-queue
+        target:
+          type: AverageValue
+          averageValue: 100           # 100 messages par pod
+
+  # ── Comportement de scaling ───────────────────────────────
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60  # Attendre 60s avant scale up
+      selectPolicy: Max               # Max | Min | Disabled
+      policies:
+        - type: Pods                  # Ajouter au max 4 pods à la fois
+          value: 4
+          periodSeconds: 60
+        - type: Percent               # Ou 100% des pods actuels max
+          value: 100
+          periodSeconds: 60
+
+    scaleDown:
+      stabilizationWindowSeconds: 300 # Attendre 5min avant scale down (éviter flapping)
+      selectPolicy: Min               # Prendre la politique la plus conservative
+      policies:
+        - type: Pods                  # Supprimer max 1 pod toutes les 60s
+          value: 1
+          periodSeconds: 60
+        - type: Percent               # Ou max 10% par minute
+          value: 10
+          periodSeconds: 60
+
+---
+# HPA v1 (syntaxe simple - déprécié mais encore utilisé)
+apiVersion: autoscaling/v1
+kind: HorizontalPodAutoscaler
+metadata:
+  name: my-hpa-v1
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: my-deployment
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+
+---
+# ─────────────────────────────────────────────────────────────
+# VPA - VerticalPodAutoscaler
+# ─────────────────────────────────────────────────────────────
+# Ajuste automatiquement les requests/limits CPU et mémoire des conteneurs.
+# Nécessite: VPA Operator installé dans le cluster.
+# ATTENTION: ne pas utiliser HPA (CPU/Memory) + VPA simultanément!
+
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: my-vpa
+  namespace: default
+
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: my-deployment
+
+  # ── Mode de mise à jour ──────────────────────────────────
+  updatePolicy:
+    updateMode: Auto                  # Off | Initial | Recreate | Auto
+    # Off:       Recommandations seulement (voir via kubectl describe vpa)
+    # Initial:   Applique seulement aux nouveaux pods
+    # Recreate:  Recrée les pods pour appliquer les changements
+    # Auto:      Recrée les pods si nécessaire (comportement par défaut)
+
+    evictionRequirements:
+      - resources: [cpu, memory]
+        changeRequirement: TargetHigherThanRequests
+
+  # ── Configuration par conteneur ──────────────────────────
+  resourcePolicy:
+    containerPolicies:
+      - containerName: app            # "*" pour tous les conteneurs
+        mode: Auto                    # Auto | Off (désactiver pour ce conteneur)
+
+        # Limites des recommandations VPA
+        minAllowed:
+          cpu: 100m
+          memory: 128Mi
+        maxAllowed:
+          cpu: "4"
+          memory: 8Gi
+
+        # Types de ressources gérés
+        controlledResources: [cpu, memory]
+
+        # Types de requêtes gérés
+        controlledValues: RequestsAndLimits  # RequestsOnly | RequestsAndLimits
+
+      - containerName: sidecar
+        mode: Off                     # Ne pas ajuster le sidecar
+
+---
+# ─────────────────────────────────────────────────────────────
+# PDB - PodDisruptionBudget
+# ─────────────────────────────────────────────────────────────
+# Garantit qu'un minimum de pods restent disponibles pendant les disruptions.
+# Disruptions volontaires: maintenance nœud, drain, upgrade cluster.
+
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: my-pdb
+  namespace: default
+
+spec:
+  # ── Sélecteur de pods ────────────────────────────────────
+  selector:
+    matchLabels:
+      app: my-app
+    # matchExpressions:
+    #   - key: app
+    #     operator: In
+    #     values: [my-app, my-app-canary]
+
+  # ── Disponibilité garantie (choisir UNE des deux options) ─
+  minAvailable: 2                     # Minimum de pods disponibles (nombre ou %)
+  # minAvailable: "50%"               # Au moins 50% des pods
+
+  # maxUnavailable: 1                 # Maximum de pods indisponibles (nombre ou %)
+  # maxUnavailable: "25%"             # Au plus 25% indisponibles
+
+  # ── Politique d'unhealthy pods (K8s 1.27+) ──────────────
+  unhealthyPodEvictionPolicy: IfHealthyBudget
+  # IfHealthyBudget: éviction des pods unhealthy respecte le PDB
+  # AlwaysAllow:     les pods unhealthy peuvent toujours être évincés
+
+---
+# PDB pour StatefulSet (souvent plus strict)
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: statefulset-pdb
+  namespace: production
+spec:
+  selector:
+    matchLabels:
+      app: my-database
+  maxUnavailable: 1                   # Jamais plus d'1 DB pod unavailable
+  # Pour 3 répliques: toujours au moins 2 disponibles
+
+---
+# PDB pour déploiement haute disponibilité
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ha-app-pdb
+spec:
+  selector:
+    matchLabels:
+      app: ha-app
+  minAvailable: "67%"                 # Toujours 2/3 disponibles minimum
+
+---
+# ─────────────────────────────────────────────────────────────
+# COMMANDES KUBECTL
+# ─────────────────────────────────────────────────────────────
+#
+# HPA:
+#   kubectl apply -f hpa.yaml
+#   kubectl get hpa
+#   kubectl get hpa -o wide           # Affiche métriques actuelles
+#   kubectl describe hpa my-hpa       # Détails et événements
+#   kubectl top pods -l app=my-app    # Utilisation CPU/Mémoire actuelle
+#   kubectl top nodes
+#
+# Vérifier le scaling:
+#   watch kubectl get hpa             # Observer le scaling en temps réel
+#   kubectl get events --field-selector involvedObject.name=my-hpa
+#
+# Scaling manuel (override HPA temporairement):
+#   kubectl scale deployment my-deployment --replicas=5
+#
+# VPA:
+#   kubectl get vpa
+#   kubectl describe vpa my-vpa       # Voir les recommandations
+#   # Exemple de sortie:
+#   # Recommendation:
+#   #   Container Recommendations:
+#   #     Container Name: app
+#   #       Lower Bound: cpu: 25m, memory: 128Mi
+#   #       Target:      cpu: 100m, memory: 256Mi
+#   #       Upper Bound: cpu: 500m, memory: 1Gi
+#
+# PDB:
+#   kubectl get pdb
+#   kubectl describe pdb my-pdb
+#   # STATUS: Allowed Disruptions = nombre de pods pouvant être évincés maintenant
+#
+# Tester le PDB (drainage d'un nœud):
+#   kubectl drain worker-node-1 --ignore-daemonsets --delete-emptydir-data
+#   # Le drain respectera les PDB
+
+# Métriques (metrics-server):
+#   kubectl top pods
+#   kubectl top nodes
+#   kubectl top pods --containers     # Par conteneur

@@ -1,0 +1,294 @@
+# ============================================================
+# KUBERNETES DAEMONSET - CHEATSHEET COMPLET
+# ============================================================
+# Lance UN pod sur CHAQUE nœud du cluster (ou un sous-ensemble).
+# Cas d'usage: agents de monitoring, collecteurs de logs, proxies réseau,
+#              drivers de stockage, agents de sécurité.
+
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: my-daemonset
+  namespace: default                    # kube-system pour les agents système
+  labels:
+    app: node-agent
+    tier: monitoring
+
+spec:
+  selector:
+    matchLabels:
+      app: node-agent
+
+  # ─── STRATÉGIE DE MISE À JOUR ─────────────────────────────
+  updateStrategy:
+    type: RollingUpdate                 # RollingUpdate | OnDelete
+    rollingUpdate:
+      maxUnavailable: 1                 # Pods mis à jour simultanément (nombre ou %)
+      maxSurge: 0                       # Pods supplémentaires pendant MAJ (K8s 1.25+)
+
+  revisionHistoryLimit: 10
+
+  # Durée min avant qu'un pod soit "disponible" (Ready)
+  minReadySeconds: 0
+
+  # ─── TEMPLATE DU POD ──────────────────────────────────────
+  template:
+    metadata:
+      labels:
+        app: node-agent
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9100"
+
+    spec:
+      # ── ACCÈS AU NŒUD HÔTE ────────────────────────────────
+      hostNetwork: false                # Utiliser le réseau de l'hôte
+      hostPID: false                    # Accès aux processus de l'hôte
+      hostIPC: false                    # Accès IPC de l'hôte
+
+      # ── SCHEDULING ────────────────────────────────────────
+      # Tolerer les taints sur les nœuds système
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+        - key: "node.kubernetes.io/not-ready"
+          operator: Exists
+          effect: NoExecute
+        - key: "node.kubernetes.io/unreachable"
+          operator: Exists
+          effect: NoExecute
+        - key: "node.kubernetes.io/disk-pressure"
+          operator: Exists
+          effect: NoSchedule
+        - key: "node.kubernetes.io/memory-pressure"
+          operator: Exists
+          effect: NoSchedule
+        - key: "node.kubernetes.io/unschedulable"
+          operator: Exists
+          effect: NoSchedule
+
+      # Sélectionner uniquement certains nœuds
+      nodeSelector:
+        kubernetes.io/os: linux
+        # node-type: worker             # Label personnalisé
+
+      # Affinité pour nœuds spécifiques
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/arch
+                    operator: In
+                    values: ["amd64", "arm64"]
+
+      # Priorité haute pour les agents système
+      priorityClassName: system-node-critical  # system-cluster-critical | system-node-critical
+
+      # ── SERVICE ACCOUNT ───────────────────────────────────
+      serviceAccountName: node-agent-sa
+      automountServiceAccountToken: true
+
+      # ── CONTENEUR AGENT ───────────────────────────────────
+      containers:
+        - name: node-exporter          # Exemple: Prometheus Node Exporter
+          image: prom/node-exporter:v1.7.0
+          imagePullPolicy: IfNotPresent
+
+          args:
+            - --path.procfs=/host/proc
+            - --path.rootfs=/host/root
+            - --path.sysfs=/host/sys
+            - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)
+
+          ports:
+            - name: metrics
+              containerPort: 9100
+              protocol: TCP
+              hostPort: 9100            # Port sur l'hôte (attention aux conflits)
+
+          # Variables d'env avec infos du nœud
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "256Mi"
+
+          volumeMounts:
+            - name: proc
+              mountPath: /host/proc
+              readOnly: true
+            - name: sys
+              mountPath: /host/sys
+              readOnly: true
+            - name: root
+              mountPath: /host/root
+              readOnly: true
+              mountPropagation: HostToContainer  # None | HostToContainer | Bidirectional
+            - name: varlog
+              mountPath: /var/log
+              readOnly: true
+            - name: varlibdockercontainers
+              mountPath: /var/lib/docker/containers
+              readOnly: true
+
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 9100
+            initialDelaySeconds: 10
+            periodSeconds: 30
+
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 9100
+            initialDelaySeconds: 5
+            periodSeconds: 10
+
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534            # nobody
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["SYS_PTRACE"]       # Certains agents ont besoin d'accès kernel
+
+      # ─── VOLUMES HÔTE ─────────────────────────────────────
+      volumes:
+        - name: proc
+          hostPath:
+            path: /proc
+            type: Directory
+        - name: sys
+          hostPath:
+            path: /sys
+            type: Directory
+        - name: root
+          hostPath:
+            path: /
+            type: Directory
+        - name: varlog
+          hostPath:
+            path: /var/log
+            type: Directory
+        - name: varlibdockercontainers
+          hostPath:
+            path: /var/lib/docker/containers
+            type: DirectoryOrCreate
+
+      terminationGracePeriodSeconds: 30
+      dnsPolicy: ClusterFirst
+
+---
+# ─────────────────────────────────────────────────────────────
+# EXEMPLE: Fluentd Log Collector
+# ─────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluentd
+  namespace: kube-system
+  labels:
+    k8s-app: fluentd-logging
+spec:
+  selector:
+    matchLabels:
+      k8s-app: fluentd-logging
+  template:
+    metadata:
+      labels:
+        k8s-app: fluentd-logging
+    spec:
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      serviceAccountName: fluentd
+      containers:
+        - name: fluentd
+          image: fluent/fluentd-kubernetes-daemonset:v1
+          env:
+            - name: FLUENT_ELASTICSEARCH_HOST
+              value: "elasticsearch.logging.svc.cluster.local"
+            - name: FLUENT_ELASTICSEARCH_PORT
+              value: "9200"
+          resources:
+            limits:
+              memory: 200Mi
+            requests:
+              cpu: 100m
+              memory: 200Mi
+          volumeMounts:
+            - name: varlog
+              mountPath: /var/log
+            - name: dockercontainerlogpath
+              mountPath: /var/lib/docker/containers
+              readOnly: true
+            - name: config
+              mountPath: /fluentd/etc
+      terminationGracePeriodSeconds: 30
+      volumes:
+        - name: varlog
+          hostPath:
+            path: /var/log
+        - name: dockercontainerlogpath
+          hostPath:
+            path: /var/lib/docker/containers
+        - name: config
+          configMap:
+            name: fluentd-config
+
+---
+# ─────────────────────────────────────────────────────────────
+# COMMANDES KUBECTL
+# ─────────────────────────────────────────────────────────────
+#
+# kubectl apply -f daemonset.yaml
+# kubectl get daemonsets
+# kubectl get ds -o wide
+# kubectl describe daemonset my-daemonset
+#
+# Vérifier sur quels nœuds il tourne:
+#   kubectl get pods -l app=node-agent -o wide
+#
+# Nombre de pods attendus vs disponibles:
+#   kubectl get ds my-daemonset
+#   # DESIRED | CURRENT | READY | UP-TO-DATE | AVAILABLE | NODE SELECTOR
+#
+# Rollout:
+#   kubectl rollout status daemonset/my-daemonset
+#   kubectl rollout history daemonset/my-daemonset
+#   kubectl rollout undo daemonset/my-daemonset
+#
+# Forcer la mise à jour sur un nœud (OnDelete strategy):
+#   kubectl delete pod <pod-name>
+#
+# Ajouter/retirer un nœud du DaemonSet (via labels):
+#   kubectl label node worker-1 node-type=worker
+#   kubectl label node worker-1 node-type-         # Retirer le label

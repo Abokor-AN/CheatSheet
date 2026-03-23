@@ -1,0 +1,427 @@
+# ============================================================
+# REPLICASET, ENDPOINTSLICE, GATEWAY API - CHEATSHEET
+# ============================================================
+
+# ─────────────────────────────────────────────────────────────
+# REPLICASET
+# ─────────────────────────────────────────────────────────────
+# Maintient un nombre stable de pods identiques.
+# En pratique: géré par un Deployment. Rarement créé directement.
+# Utile à comprendre pour: rollbacks, selector immuable, ownership.
+
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: my-replicaset
+  namespace: default
+  labels:
+    app: my-app
+    tier: frontend
+
+spec:
+  replicas: 3
+
+  # IMMUABLE après création
+  selector:
+    matchLabels:
+      app: my-app
+    # matchExpressions:
+    #   - key: app
+    #     operator: In
+    #     values: [my-app]
+
+  template:
+    metadata:
+      labels:
+        app: my-app                   # DOIT matcher selector
+    spec:
+      containers:
+        - name: app
+          image: nginx:1.25
+          ports:
+            - containerPort: 80
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+
+# IMPORTANT: Un pod existant avec les mêmes labels sera "adopté"
+# par le ReplicaSet même s'il n'a pas été créé par lui.
+# C'est pourquoi les labels doivent être uniques par ReplicaSet.
+
+# Différences ReplicaSet vs ReplicationController (déprécié):
+# - ReplicaSet supporte matchExpressions
+# - ReplicaSet est requis par Deployment
+
+---
+# ─────────────────────────────────────────────────────────────
+# ENDPOINTSLICE (K8s 1.21+ - remplace Endpoints)
+# ─────────────────────────────────────────────────────────────
+# Endpoints fragmentés pour meilleure scalabilité (max 100 endpoints/slice).
+# Créés automatiquement par le Service controller — rarement créés manuellement.
+
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: my-service-abc12              # Nom auto-généré par K8s
+  namespace: default
+  labels:
+    kubernetes.io/service-name: my-service  # REQUIS: lie au Service
+  ownerReferences:
+    - apiVersion: v1
+      kind: Service
+      name: my-service
+      uid: <service-uid>
+      controller: true
+      blockOwnerDeletion: true
+
+addressType: IPv4                     # IPv4 | IPv6 | FQDN
+
+endpoints:
+  - addresses: ["10.244.0.5"]
+    conditions:
+      ready: true                     # Pod prêt
+      serving: true                   # Pod peut servir des requêtes
+      terminating: false              # Pod en cours de terminaison
+    hostname: pod-0                   # Hostname du pod (StatefulSet)
+    nodeName: worker-1
+    zone: us-east-1a
+    targetRef:
+      kind: Pod
+      name: my-pod-abc12
+      namespace: default
+      uid: <pod-uid>
+    hints:                            # Topology-aware routing hints
+      forZones:
+        - name: us-east-1a
+
+  - addresses: ["10.244.1.7"]
+    conditions:
+      ready: true
+      serving: true
+      terminating: false
+    nodeName: worker-2
+    zone: us-east-1b
+
+ports:
+  - name: http
+    protocol: TCP
+    port: 8080
+    appProtocol: http                 # http | https | grpc | mysql | etc.
+  - name: metrics
+    protocol: TCP
+    port: 9090
+
+---
+# EndpointSlice pour service externe (sans selector)
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: external-db-slice
+  namespace: default
+  labels:
+    kubernetes.io/service-name: external-db
+addressType: IPv4
+endpoints:
+  - addresses: ["192.168.1.100"]
+    conditions:
+      ready: true
+  - addresses: ["192.168.1.101"]
+    conditions:
+      ready: true
+ports:
+  - port: 5432
+    protocol: TCP
+    appProtocol: postgresql
+
+---
+# ─────────────────────────────────────────────────────────────
+# GATEWAY API (K8s 1.28+ GA - successeur de l'Ingress)
+# ─────────────────────────────────────────────────────────────
+# Plus expressif que l'Ingress: séparation infra/app, multi-protocoles.
+# Nécessite: installation des CRDs Gateway API + un controller compatible
+# (Contour, Cilium, Istio, nginx-gateway-fabric, etc.)
+#
+# Hiérarchie:
+# GatewayClass → Gateway → HTTPRoute / TCPRoute / TLSRoute / GRPCRoute
+
+# 1. GatewayClass (défini par l'infra/ops team)
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: nginx
+spec:
+  controllerName: gateway.nginx.org/nginx-gateway-controller
+  parametersRef:                      # Config spécifique au controller
+    group: gateway.nginx.org
+    kind: NginxProxy
+    name: nginx-proxy-config
+    namespace: nginx-gateway
+  description: "NGINX Gateway Fabric"
+
+---
+# 2. Gateway (défini par l'ops team - ressource partagée)
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: prod-gateway
+  namespace: gateway-infra            # Namespace de l'infra
+
+spec:
+  gatewayClassName: nginx
+
+  # Listeners (ports/protocoles écoutés)
+  listeners:
+    - name: http
+      port: 80
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Selector              # All | Same | Selector
+          selector:
+            matchLabels:
+              gateway-access: "true"
+        kinds:
+          - kind: HTTPRoute
+
+    - name: https
+      port: 443
+      protocol: HTTPS
+      hostname: "*.example.com"       # Wildcard hostname
+      tls:
+        mode: Terminate               # Terminate | Passthrough
+        certificateRefs:
+          - name: wildcard-tls
+            namespace: gateway-infra
+      allowedRoutes:
+        namespaces:
+          from: All
+
+    - name: tcp-db
+      port: 5432
+      protocol: TCP
+      allowedRoutes:
+        kinds:
+          - kind: TCPRoute
+
+    - name: grpc
+      port: 9090
+      protocol: HTTP                  # gRPC utilise HTTP/2
+      allowedRoutes:
+        kinds:
+          - kind: GRPCRoute
+
+  # Infrastructure (K8s 1.29+)
+  infrastructure:
+    labels:
+      app: prod-gateway
+    annotations:
+      service.beta.kubernetes.io/aws-load-balancer-type: nlb
+
+  addresses:
+    - type: IPAddress
+      value: "203.0.113.100"          # IP statique
+
+---
+# 3. HTTPRoute (défini par les dev teams)
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: my-app-route
+  namespace: production               # Namespace de l'application
+
+spec:
+  # Référence au Gateway parent
+  parentRefs:
+    - name: prod-gateway
+      namespace: gateway-infra
+      sectionName: https              # Listener spécifique
+      port: 443
+
+  # Hostnames filtrés
+  hostnames:
+    - "app.example.com"
+    - "www.example.com"
+
+  rules:
+    # Règle 1: route API vers backend
+    - matches:
+        - path:
+            type: PathPrefix          # Exact | PathPrefix | RegularExpression
+            value: /api
+          method: GET                 # GET | POST | PUT | DELETE | PATCH | etc.
+          headers:
+            - name: Content-Type
+              type: Exact             # Exact | RegularExpression
+              value: application/json
+          queryParams:
+            - name: version
+              type: Exact
+              value: "v2"
+
+      filters:
+        - type: RequestHeaderModifier
+          requestHeaderModifier:
+            add:
+              - name: X-Forwarded-For
+                value: "gateway"
+            set:
+              - name: X-Request-ID
+                value: "$(context.request.header.X-Request-ID)"
+            remove: ["X-Internal-Token"]
+
+        - type: ResponseHeaderModifier
+          responseHeaderModifier:
+            add:
+              - name: X-Cache
+                value: "MISS"
+
+        - type: URLRewrite
+          urlRewrite:
+            hostname: "backend.internal"
+            path:
+              type: ReplacePrefixMatch
+              replacePrefixMatch: /v2
+
+        - type: RequestMirror        # Miroir vers autre service (A/B testing)
+          requestMirror:
+            backendRef:
+              name: canary-service
+              port: 8080
+            fraction:
+              numerator: 10
+              denominator: 100        # 10% mirrored
+
+        - type: ExtensionRef         # Filtre personnalisé (ex: rate limit)
+          extensionRef:
+            group: gateway.nginx.org
+            kind: ObservabilityPolicy
+            name: my-observability-policy
+
+      backendRefs:
+        - name: api-service
+          port: 8080
+          weight: 90                  # Traffic splitting
+        - name: api-canary-service
+          port: 8080
+          weight: 10
+
+    # Règle 2: redirect HTTP vers HTTPS
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      filters:
+        - type: RequestRedirect
+          requestRedirect:
+            scheme: https
+            statusCode: 301           # 301 | 302
+
+    # Règle 3: route par défaut
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: frontend-service
+          port: 80
+
+  # Timeouts (K8s 1.28+)
+  timeouts:
+    request: 30s
+    backendRequest: 10s
+
+---
+# TCPRoute
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: TCPRoute
+metadata:
+  name: db-route
+  namespace: production
+spec:
+  parentRefs:
+    - name: prod-gateway
+      namespace: gateway-infra
+      sectionName: tcp-db
+  rules:
+    - backendRefs:
+        - name: postgres-service
+          port: 5432
+
+---
+# GRPCRoute (K8s 1.28+ GA)
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata:
+  name: grpc-route
+  namespace: production
+spec:
+  parentRefs:
+    - name: prod-gateway
+      namespace: gateway-infra
+      sectionName: grpc
+  hostnames: ["grpc.example.com"]
+  rules:
+    - matches:
+        - method:
+            type: Exact
+            service: my.grpc.Service
+            method: MyMethod
+      backendRefs:
+        - name: grpc-service
+          port: 9090
+
+---
+# ReferenceGrant: autorise un Route d'un namespace à cibler un service d'un autre
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: allow-prod-to-infra
+  namespace: gateway-infra            # Namespace cible (où est la ressource)
+spec:
+  from:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      namespace: production           # Namespace source (où est la Route)
+  to:
+    - group: ""
+      kind: Secret                    # Autoriser accès aux Secrets TLS
+
+---
+# ─────────────────────────────────────────────────────────────
+# COMMANDES KUBECTL
+# ─────────────────────────────────────────────────────────────
+#
+# ReplicaSet:
+#   kubectl get replicasets
+#   kubectl get rs
+#   kubectl describe rs my-replicaset
+#   kubectl scale rs my-replicaset --replicas=5
+#   # Voir le RS actif d'un Deployment:
+#   kubectl get rs -l app=my-app
+#
+# EndpointSlice:
+#   kubectl get endpointslices
+#   kubectl get endpointslices -l kubernetes.io/service-name=my-service
+#   kubectl describe endpointslice my-service-abc12
+#   # Voir les endpoints d'un service:
+#   kubectl get endpoints my-service    # Ancienne API
+#   kubectl get endpointslices -l kubernetes.io/service-name=my-service
+#
+# Gateway API:
+#   # Installer les CRDs:
+#   kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.0/standard-install.yaml
+#
+#   kubectl get gatewayclasses
+#   kubectl get gateways -A
+#   kubectl get httproutes -A
+#   kubectl get tcproutes -A
+#   kubectl get grpcroutes -A
+#   kubectl describe gateway prod-gateway -n gateway-infra
+#   kubectl describe httproute my-app-route -n production
+#
+#   # Vérifier le statut:
+#   kubectl get gateway prod-gateway -o jsonpath='{.status.conditions}'

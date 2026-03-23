@@ -1,0 +1,424 @@
+# ============================================================
+# KUBERNETES POD - CHEATSHEET COMPLET
+# ============================================================
+# Un Pod est l'unité de déploiement la plus petite dans K8s.
+# Il encapsule un ou plusieurs conteneurs partageant le même réseau et stockage.
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: my-pod
+  namespace: default                        # Namespace (default si omis)
+  labels:                                   # Labels pour sélection/filtrage
+    app: my-app
+    env: production
+    version: "1.0"
+  annotations:                              # Métadonnées non-sélectionnables
+    description: "Pod de démonstration"
+    owner: "team-backend"
+
+spec:
+  # ─── CONTENEURS PRINCIPAUX ────────────────────────────────
+  containers:
+    - name: main-container
+      image: nginx:1.25                     # Image:tag
+      imagePullPolicy: Always               # Always | Never | IfNotPresent
+
+      # Ports exposés (informatif, non-bloquant)
+      ports:
+        - name: http
+          containerPort: 80
+          protocol: TCP                     # TCP | UDP | SCTP
+        - name: https
+          containerPort: 443
+
+      # Variables d'environnement
+      env:
+        - name: ENV_VAR_LITERAL
+          value: "ma-valeur"
+        - name: ENV_FROM_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: my-secret
+              key: password
+              optional: false
+        - name: ENV_FROM_CONFIGMAP
+          valueFrom:
+            configMapKeyRef:
+              name: my-configmap
+              key: config-key
+        - name: POD_NAME                    # Downward API
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: CPU_REQUEST
+          valueFrom:
+            resourceFieldRef:
+              containerName: main-container
+              resource: requests.cpu
+
+      # Toutes les vars d'un ConfigMap ou Secret
+      envFrom:
+        - configMapRef:
+            name: my-configmap
+            optional: true
+        - secretRef:
+            name: my-secret
+            optional: true
+        - prefix: "APP_"                    # Préfixe ajouté à toutes les vars
+          configMapRef:
+            name: another-configmap
+
+      # Ressources CPU/Mémoire
+      resources:
+        requests:                           # Minimum garanti
+          cpu: "250m"                       # 250 millicores = 0.25 CPU
+          memory: "128Mi"
+          ephemeral-storage: "1Gi"
+        limits:                             # Maximum autorisé
+          cpu: "500m"
+          memory: "256Mi"
+          ephemeral-storage: "2Gi"
+
+      # Montages de volumes
+      volumeMounts:
+        - name: config-volume
+          mountPath: /etc/config
+          readOnly: true
+        - name: data-volume
+          mountPath: /data
+          subPath: myapp                    # Sous-dossier dans le volume
+        - name: secret-volume
+          mountPath: /etc/secrets
+          readOnly: true
+
+      # Commande et arguments (override ENTRYPOINT et CMD de l'image)
+      command: ["/bin/sh"]                  # Override ENTRYPOINT
+      args: ["-c", "nginx -g 'daemon off;'"] # Override CMD
+
+      # Probe de liveness (redémarre si échoue)
+      livenessProbe:
+        httpGet:
+          path: /healthz
+          port: 8080
+          httpHeaders:
+            - name: Custom-Header
+              value: my-value
+        initialDelaySeconds: 30            # Attente avant premier check
+        periodSeconds: 10                  # Intervalle entre checks
+        timeoutSeconds: 5                  # Timeout par check
+        failureThreshold: 3               # Nb échecs avant redémarrage
+        successThreshold: 1               # Nb succès pour considérer OK
+
+      # Probe de readiness (retire du Service si échoue)
+      readinessProbe:
+        httpGet:
+          path: /ready
+          port: 8080
+        initialDelaySeconds: 5
+        periodSeconds: 5
+        timeoutSeconds: 3
+        failureThreshold: 3
+        successThreshold: 1
+
+      # Probe de startup (désactive liveness/readiness pendant démarrage)
+      startupProbe:
+        httpGet:
+          path: /healthz
+          port: 8080
+        failureThreshold: 30              # 30 * 10s = 5min max pour démarrer
+        periodSeconds: 10
+
+      # Probe TCP (alternative à httpGet)
+      # livenessProbe:
+      #   tcpSocket:
+      #     port: 3306
+      #   initialDelaySeconds: 15
+
+      # Probe exec (commande dans le conteneur)
+      # livenessProbe:
+      #   exec:
+      #     command: ["cat", "/tmp/healthy"]
+
+      # Probe gRPC
+      # livenessProbe:
+      #   grpc:
+      #     port: 8080
+      #     service: my-service
+
+      # Contexte de sécurité du conteneur
+      securityContext:
+        runAsUser: 1000                   # UID
+        runAsGroup: 3000                  # GID
+        runAsNonRoot: true               # Interdit root
+        readOnlyRootFilesystem: true     # FS racine en lecture seule
+        allowPrivilegeEscalation: false  # Interdit sudo/setuid
+        privileged: false                # Mode privilégié
+        capabilities:
+          add: ["NET_ADMIN", "SYS_TIME"]
+          drop: ["ALL"]                  # Drop toutes puis add sélectif
+        seccompProfile:
+          type: RuntimeDefault           # RuntimeDefault | Localhost | Unconfined
+        appArmorProfile:
+          type: RuntimeDefault
+
+      # Politique de redémarrage du conteneur
+      # (override spec.restartPolicy au niveau conteneur non supporté,
+      #  mais lifecycle hooks sont disponibles)
+      lifecycle:
+        postStart:                        # Exécuté juste après démarrage
+          exec:
+            command: ["/bin/sh", "-c", "echo started > /tmp/started"]
+        preStop:                          # Exécuté avant arrêt
+          exec:
+            command: ["/bin/sh", "-c", "sleep 5"]
+          # httpGet:
+          #   path: /shutdown
+          #   port: 8080
+
+      # Gestion du terminal
+      stdin: false
+      stdinOnce: false
+      tty: false
+
+      # Politique de terminaison
+      terminationMessagePath: /dev/termination-log
+      terminationMessagePolicy: File     # File | FallbackToLogsOnError
+
+  # ─── CONTENEURS INIT ──────────────────────────────────────
+  # Exécutés séquentiellement AVANT les conteneurs principaux
+  initContainers:
+    - name: init-db
+      image: busybox:1.35
+      command: ['sh', '-c', 'until nc -z db-service 5432; do echo waiting; sleep 2; done']
+      resources:
+        requests:
+          cpu: "50m"
+          memory: "32Mi"
+
+  # ─── CONTENEURS ÉPHÉMÈRES (debugging) ─────────────────────
+  # Ajoutés à un pod en cours d'exécution pour debugging
+  # ephemeralContainers: []  # Géré via kubectl debug
+
+  # ─── VOLUMES ──────────────────────────────────────────────
+  volumes:
+    # ConfigMap monté en volume
+    - name: config-volume
+      configMap:
+        name: my-configmap
+        items:                            # Sélection de clés spécifiques
+          - key: config.properties
+            path: app.properties
+            mode: 0644
+        defaultMode: 0644               # Permissions par défaut
+
+    # Secret monté en volume
+    - name: secret-volume
+      secret:
+        secretName: my-secret
+        items:
+          - key: tls.crt
+            path: cert.pem
+        defaultMode: 0400               # Lecture seule propriétaire
+
+    # emptyDir (temporaire, vide au démarrage du pod)
+    - name: data-volume
+      emptyDir:
+        medium: ""                      # "" (disk) | Memory (tmpfs)
+        sizeLimit: "500Mi"
+
+    # hostPath (dossier du nœud hôte - DANGEREUX en prod)
+    - name: host-volume
+      hostPath:
+        path: /var/log
+        type: Directory                 # Directory | File | Socket | CharDevice | BlockDevice
+                                        # DirectoryOrCreate | FileOrCreate
+
+    # PersistentVolumeClaim
+    - name: pvc-volume
+      persistentVolumeClaim:
+        claimName: my-pvc
+        readOnly: false
+
+    # Projected (combine plusieurs sources)
+    - name: projected-volume
+      projected:
+        sources:
+          - configMap:
+              name: my-configmap
+          - secret:
+              name: my-secret
+          - serviceAccountToken:
+              path: token
+              expirationSeconds: 3600
+              audience: "my-audience"
+          - downwardAPI:
+              items:
+                - path: "labels"
+                  fieldRef:
+                    fieldPath: metadata.labels
+
+    # downwardAPI (infos du pod)
+    - name: podinfo
+      downwardAPI:
+        items:
+          - path: "labels"
+            fieldRef:
+              fieldPath: metadata.labels
+          - path: "cpu_limit"
+            resourceFieldRef:
+              containerName: main-container
+              resource: limits.cpu
+
+    # nfs
+    - name: nfs-volume
+      nfs:
+        server: nfs-server.example.com
+        path: /exports/data
+        readOnly: false
+
+    # CSI (Container Storage Interface)
+    - name: csi-volume
+      csi:
+        driver: secrets-store.csi.k8s.io
+        readOnly: true
+        volumeAttributes:
+          secretProviderClass: my-provider
+
+  # ─── SCHEDULING ───────────────────────────────────────────
+
+  # Sélection de nœud par labels
+  nodeSelector:
+    kubernetes.io/os: linux
+    disktype: ssd
+
+  # Affinité/Anti-affinité
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:   # HARD - doit matcher
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: topology.kubernetes.io/zone
+                operator: In                            # In | NotIn | Exists | DoesNotExist | Gt | Lt
+                values: ["us-east-1a", "us-east-1b"]
+      preferredDuringSchedulingIgnoredDuringExecution:  # SOFT - préféré
+        - weight: 100                                   # 1-100
+          preference:
+            matchExpressions:
+              - key: node-type
+                operator: In
+                values: ["high-memory"]
+
+    podAffinity:                         # Regrouper avec d'autres pods
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values: ["cache"]
+          topologyKey: kubernetes.io/hostname
+
+    podAntiAffinity:                     # Éloigner d'autres pods
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchLabels:
+                app: my-app
+            topologyKey: kubernetes.io/hostname
+
+  # Tolerations (permet de scheduler sur des nœuds avec taints)
+  tolerations:
+    - key: "node-role.kubernetes.io/control-plane"
+      operator: Exists                  # Exists | Equal
+      effect: NoSchedule                # NoSchedule | PreferNoSchedule | NoExecute
+    - key: "special"
+      operator: Equal
+      value: "gpu"
+      effect: NoExecute
+      tolerationSeconds: 3600           # Durée de tolérance pour NoExecute
+
+  # Placement sur un nœud spécifique
+  nodeName: worker-node-1               # Override toute la logique de scheduling
+
+  # Topology Spread Constraints
+  topologySpreadConstraints:
+    - maxSkew: 1                        # Déséquilibre max autorisé
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: DoNotSchedule  # DoNotSchedule | ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app: my-app
+      minDomains: 2                     # Nombre min de domaines requis
+      nodeAffinityPolicy: Honor         # Honor | Ignore
+      nodeTaintsPolicy: Honor           # Honor | Ignore
+
+  # ─── RÉSEAU ───────────────────────────────────────────────
+  hostNetwork: false                    # Utiliser le réseau de l'hôte
+  hostPID: false                        # Partager le namespace PID de l'hôte
+  hostIPC: false                        # Partager le namespace IPC de l'hôte
+  dnsPolicy: ClusterFirst               # ClusterFirst | ClusterFirstWithHostNet | Default | None
+  dnsConfig:
+    nameservers: ["8.8.8.8"]
+    searches: ["my-namespace.svc.cluster.local"]
+    options:
+      - name: ndots
+        value: "5"
+  hostname: my-pod-hostname
+  subdomain: my-subdomain               # FQDN: hostname.subdomain.namespace.svc.cluster.local
+  hostAliases:                          # /etc/hosts entries
+    - ip: "192.168.1.100"
+      hostnames: ["foo.local", "bar.local"]
+  setHostnameAsFQDN: false
+
+  # ─── SÉCURITÉ ─────────────────────────────────────────────
+  serviceAccountName: my-service-account
+  automountServiceAccountToken: true   # Monte le token SA automatiquement
+
+  securityContext:                      # Contexte au niveau Pod
+    runAsUser: 1000
+    runAsGroup: 3000
+    fsGroup: 2000                       # GID pour les volumes montés
+    fsGroupChangePolicy: OnRootMismatch # Always | OnRootMismatch
+    runAsNonRoot: true
+    supplementalGroups: [4000, 5000]
+    sysctls:                            # Paramètres kernel (pod-level)
+      - name: net.ipv4.tcp_keepalive_time
+        value: "300"
+    seccompProfile:
+      type: RuntimeDefault
+
+  # ─── CYCLE DE VIE ─────────────────────────────────────────
+  restartPolicy: Always                 # Always | OnFailure | Never
+  terminationGracePeriodSeconds: 30    # Délai avant SIGKILL après SIGTERM
+
+  activeDeadlineSeconds: 600           # Durée max d'exécution (utile pour Jobs)
+
+  # ─── PRIORITÉ ─────────────────────────────────────────────
+  priorityClassName: high-priority     # Référence à un PriorityClass
+  priority: 1000                       # Valeur numérique (géré par PriorityClass)
+  preemptionPolicy: PreemptLowerPriority # PreemptLowerPriority | Never
+
+  # ─── IMAGE PULL ───────────────────────────────────────────
+  imagePullSecrets:
+    - name: registry-credentials       # Secret de type docker-registry
+
+  # ─── OVERHEAD ─────────────────────────────────────────────
+  overhead:                            # Ressources overhead (RuntimeClass)
+    cpu: "250m"
+    memory: "128Mi"
+
+  # ─── RUNTIME ──────────────────────────────────────────────
+  runtimeClassName: gvisor             # Référence à un RuntimeClass
+
+  # ─── OS ───────────────────────────────────────────────────
+  os:
+    name: linux                        # linux | windows
+
+  # ─── READINESS GATES ──────────────────────────────────────
+  readinessGates:
+    - conditionType: "www.example.com/feature-1"

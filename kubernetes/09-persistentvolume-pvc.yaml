@@ -1,0 +1,330 @@
+# ============================================================
+# KUBERNETES PERSISTENTVOLUME & PVC - CHEATSHEET COMPLET
+# ============================================================
+# PersistentVolume (PV): ressource de stockage dans le cluster
+# PersistentVolumeClaim (PVC): demande de stockage par un utilisateur
+# StorageClass: définit les classes de stockage disponibles
+
+# ─────────────────────────────────────────────────────────────
+# STORAGECLASS
+# ─────────────────────────────────────────────────────────────
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: fast-ssd
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "false"  # Classe par défaut
+
+provisioner: kubernetes.io/aws-ebs     # Driver de provisionnement
+
+# Paramètres spécifiques au provisioner
+parameters:
+  type: gp3                            # AWS: gp2, gp3, io1, io2, sc1, st1
+  iops: "3000"                         # AWS io1/io2/gp3
+  throughput: "125"                    # AWS gp3 (MB/s)
+  fsType: ext4                         # Filesystem
+  encrypted: "true"                    # Chiffrement
+  kmsKeyId: "arn:aws:kms:..."          # Clé KMS
+
+  # GCP
+  # type: pd-ssd                       # pd-standard | pd-ssd | pd-balanced | pd-extreme
+
+  # Azure
+  # skuName: Premium_LRS               # Standard_LRS | Premium_LRS | UltraSSD_LRS
+
+  # Local (exemple avec Rook/Ceph)
+  # pool: replicapool
+  # imageFormat: "2"
+  # imageFeatures: layering
+
+reclaimPolicy: Delete                  # Delete | Retain | Recycle (déprécié)
+# Delete: supprime le PV et le stockage sous-jacent
+# Retain: garde le PV et les données (nécessite nettoyage manuel)
+
+allowVolumeExpansion: true             # Permettre l'agrandissement des PVC
+volumeBindingMode: WaitForFirstConsumer # Immediate | WaitForFirstConsumer
+# Immediate: PV créé dès le PVC
+# WaitForFirstConsumer: PV créé quand un pod utilise le PVC (respect de la zone)
+
+mountOptions:                          # Options de montage
+  - discard
+  - noatime
+
+allowedTopologies:                     # Restreindre aux zones disponibles
+  - matchLabelExpressions:
+      - key: topology.kubernetes.io/zone
+        values: ["us-east-1a", "us-east-1b"]
+
+---
+# StorageClass standard (sans provisionnement dynamique)
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: manual
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: kubernetes.io/no-provisioner  # Provisionnement manuel
+volumeBindingMode: WaitForFirstConsumer
+
+---
+# ─────────────────────────────────────────────────────────────
+# PERSISTENTVOLUME (provisionnement manuel)
+# ─────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: my-pv
+  labels:
+    type: local
+    app: my-app
+
+spec:
+  capacity:
+    storage: 100Gi
+
+  # Modes d'accès
+  accessModes:
+    - ReadWriteOnce                     # RWO: un seul nœud en lecture/écriture
+    # - ReadOnlyMany                    # ROX: plusieurs nœuds en lecture
+    # - ReadWriteMany                   # RWX: plusieurs nœuds en lecture/écriture
+    # - ReadWriteOncePod                # RWOP: un seul pod (K8s 1.22+)
+
+  # Politique de récupération (override StorageClass)
+  persistentVolumeReclaimPolicy: Retain  # Retain | Delete | Recycle
+
+  # Classe de stockage
+  storageClassName: manual
+
+  # Mode de volume
+  volumeMode: Filesystem                # Filesystem | Block (raw)
+
+  # Options de montage
+  mountOptions:
+    - hard
+    - nfsvers=4.1
+
+  # ── Types de sources de volume ────────────────────────────
+
+  # Local (SSD local sur le nœud)
+  local:
+    path: /mnt/ssd/my-pv
+  nodeAffinity:                         # REQUIS pour type local
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values: [worker-node-1]
+
+---
+# PV avec NFS
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: nfs-pv
+spec:
+  capacity:
+    storage: 200Gi
+  accessModes: [ReadWriteMany]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: nfs
+  nfs:
+    server: nfs-server.example.com
+    path: /exports/data
+    readOnly: false
+
+---
+# PV avec AWS EBS (provisionnement manuel)
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: aws-ebs-pv
+spec:
+  capacity:
+    storage: 50Gi
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Delete
+  storageClassName: gp2
+  awsElasticBlockStore:
+    volumeID: vol-0123456789abcdef0
+    fsType: ext4
+    readOnly: false
+    partition: 0
+
+---
+# PV avec hostPath (développement/test uniquement)
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: hostpath-pv
+spec:
+  capacity:
+    storage: 10Gi
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Delete
+  storageClassName: standard
+  hostPath:
+    path: /data/my-app
+    type: DirectoryOrCreate
+
+---
+# ─────────────────────────────────────────────────────────────
+# PERSISTENTVOLUMECLAIM
+# ─────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: my-pvc
+  namespace: default
+  labels:
+    app: my-app
+  annotations:
+    volume.beta.kubernetes.io/storage-provisioner: kubernetes.io/aws-ebs
+
+spec:
+  # Mode d'accès (doit être supporté par le PV/StorageClass)
+  accessModes:
+    - ReadWriteOnce
+
+  # Mode du volume
+  volumeMode: Filesystem                # Filesystem | Block
+
+  # Ressources demandées
+  resources:
+    requests:
+      storage: 50Gi
+    limits:
+      storage: 100Gi                    # K8s 1.24+ (optionnel)
+
+  # Classe de stockage
+  storageClassName: fast-ssd            # "" = pas de StorageClass (PV sans classe)
+                                        # omis = classe par défaut
+
+  # Lier à un PV spécifique
+  volumeName: my-pv                     # Binding statique à un PV nommé
+
+  # Sélecteur de PV (binding statique par labels)
+  selector:
+    matchLabels:
+      type: local
+      app: my-app
+    matchExpressions:
+      - key: capacity
+        operator: Gt
+        values: ["50"]
+
+  # DataSource (cloner un PVC ou snapshot)
+  dataSource:
+    name: source-pvc                    # Nom du PVC source
+    kind: PersistentVolumeClaim
+    # kind: VolumeSnapshot              # Restaurer depuis snapshot
+    # apiGroup: snapshot.storage.k8s.io
+    # name: my-snapshot
+
+  # DataSourceRef (K8s 1.26+ - supporte des types personnalisés)
+  dataSourceRef:
+    name: source-pvc
+    kind: PersistentVolumeClaim
+
+---
+# ─────────────────────────────────────────────────────────────
+# VOLUME SNAPSHOT
+# ─────────────────────────────────────────────────────────────
+# Nécessite le CRD VolumeSnapshot (external-snapshotter)
+
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: csi-aws-vsc
+driver: ebs.csi.aws.com
+deletionPolicy: Delete                  # Delete | Retain
+
+---
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshot
+metadata:
+  name: my-snapshot
+  namespace: default
+spec:
+  volumeSnapshotClassName: csi-aws-vsc
+  source:
+    persistentVolumeClaimName: my-pvc   # PVC à snapshoter
+    # volumeSnapshotContentName: ...    # Contenu pré-existant (import)
+
+---
+# Restaurer depuis un snapshot
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: restored-pvc
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: fast-ssd
+  resources:
+    requests:
+      storage: 50Gi
+  dataSource:
+    name: my-snapshot
+    kind: VolumeSnapshot
+    apiGroup: snapshot.storage.k8s.io
+
+---
+# ─────────────────────────────────────────────────────────────
+# UTILISATION DANS UN POD
+# ─────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Pod
+metadata:
+  name: storage-demo-pod
+spec:
+  containers:
+    - name: app
+      image: my-app:1.0
+      volumeMounts:
+        - name: data
+          mountPath: /data
+        - name: config
+          mountPath: /etc/config
+          readOnly: true
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: my-pvc
+        readOnly: false
+    - name: config
+      configMap:
+        name: app-config
+
+---
+# ─────────────────────────────────────────────────────────────
+# COMMANDES KUBECTL
+# ─────────────────────────────────────────────────────────────
+#
+# StorageClass:
+#   kubectl get storageclass
+#   kubectl get sc
+#   kubectl describe storageclass fast-ssd
+#
+# PersistentVolume:
+#   kubectl get pv
+#   kubectl get pv -o wide
+#   kubectl describe pv my-pv
+#   # STATUS: Available | Bound | Released | Failed
+#
+# PersistentVolumeClaim:
+#   kubectl get pvc
+#   kubectl get pvc -n my-namespace
+#   kubectl describe pvc my-pvc
+#   # STATUS: Pending | Bound | Lost
+#
+# Redimensionner un PVC (si allowVolumeExpansion: true):
+#   kubectl patch pvc my-pvc -p '{"spec":{"resources":{"requests":{"storage":"100Gi"}}}}'
+#
+# Snapshots:
+#   kubectl get volumesnapshot
+#   kubectl get volumesnapshotcontent
+#   kubectl describe volumesnapshot my-snapshot
+#
+# Debug:
+#   kubectl describe pvc my-pvc       # Voir les événements de binding
+#   kubectl get events --field-selector involvedObject.name=my-pvc

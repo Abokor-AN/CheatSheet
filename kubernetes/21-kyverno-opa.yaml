@@ -1,0 +1,489 @@
+# ============================================================
+# KYVERNO & OPA/GATEKEEPER - CHEATSHEET
+# ============================================================
+# Policy engines pour valider, muter et générer des ressources K8s.
+#
+# Kyverno:   policies en YAML natif, plus simple
+# OPA/Gatekeeper: policies en Rego (langage dédié), plus puissant
+
+# ─────────────────────────────────────────────────────────────
+# KYVERNO
+# ─────────────────────────────────────────────────────────────
+# Installation:
+#   helm repo add kyverno https://kyverno.github.io/kyverno/
+#   helm install kyverno kyverno/kyverno -n kyverno --create-namespace
+
+# ── ClusterPolicy (cluster-wide) vs Policy (namespace) ────
+# ClusterPolicy s'applique à tout le cluster
+# Policy s'applique uniquement dans son namespace
+
+# POLITIQUE 1: Valider - exiger des labels
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-labels
+  annotations:
+    policies.kyverno.io/title: "Require Labels"
+    policies.kyverno.io/category: "Best Practices"
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/description: "Tous les Deployments doivent avoir les labels app et owner"
+
+spec:
+  # ── Mode de la politique ──────────────────────────────────
+  validationFailureAction: Audit      # Audit (log) | Enforce (bloquer)
+  # validationFailureAction: Enforce  # Bloque les ressources non conformes
+  background: true                    # Vérifie aussi les ressources existantes
+
+  # ── Règles ───────────────────────────────────────────────
+  rules:
+    - name: check-team-label
+      match:
+        any:
+          - resources:
+              kinds: [Deployment]
+              namespaces: ["production", "staging"]
+
+      exclude:
+        any:
+          - resources:
+              namespaces: [kube-system]
+          - subjects:
+              - kind: ServiceAccount
+                name: system-deployer
+
+      validate:
+        message: "Le label 'app' et 'owner' sont requis sur tous les Deployments"
+        pattern:
+          metadata:
+            labels:
+              app: "?*"              # Non-vide
+              owner: "?*"
+
+---
+# POLITIQUE 2: Valider - interdire :latest
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-latest-tag
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: require-image-tag
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      validate:
+        message: "Utiliser un tag d'image spécifique, pas 'latest'"
+        foreach:
+          - list: "request.object.spec.containers"
+            pattern:
+              image: "!*:latest"    # Interdit :latest
+          - list: "request.object.spec.initContainers"
+            pattern:
+              image: "!*:latest"
+
+---
+# POLITIQUE 3: Valider avec CEL (K8s 1.26+)
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-resources
+spec:
+  validationFailureAction: Enforce
+  rules:
+    - name: check-container-resources
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      validate:
+        cel:
+          expressions:
+            - expression: >
+                object.spec.containers.all(c,
+                  has(c.resources) &&
+                  has(c.resources.requests) &&
+                  has(c.resources.requests.memory) &&
+                  has(c.resources.limits) &&
+                  has(c.resources.limits.memory)
+                )
+              message: "Tous les conteneurs doivent avoir des requests et limits de mémoire"
+
+---
+# POLITIQUE 4: Muter - ajouter des labels automatiquement
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: add-labels
+spec:
+  rules:
+    - name: add-team-label
+      match:
+        any:
+          - resources:
+              kinds: [Deployment, StatefulSet, DaemonSet]
+      mutate:
+        patchStrategicMerge:
+          metadata:
+            labels:
+              +(managed-by): kyverno  # "+(" = ajouter seulement si absent
+
+---
+# POLITIQUE 5: Muter - ajouter security context
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: add-security-context
+spec:
+  rules:
+    - name: add-securitycontext
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      mutate:
+        foreach:
+          - list: "request.object.spec.containers"
+            patchStrategicMerge:
+              spec:
+                containers:
+                  - (name): "{{ element.name }}"
+                    securityContext:
+                      +(allowPrivilegeEscalation): false
+                      +(readOnlyRootFilesystem): true
+
+---
+# POLITIQUE 6: Muter avec JSON Patch
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: add-default-requests
+spec:
+  rules:
+    - name: add-requests
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      mutate:
+        patchesJson6902: |-
+          - op: add
+            path: /spec/containers/0/resources/requests
+            value:
+              cpu: "100m"
+              memory: "128Mi"
+
+---
+# POLITIQUE 7: Générer - créer des ressources automatiquement
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: generate-networkpolicy
+spec:
+  rules:
+    - name: create-default-deny
+      match:
+        any:
+          - resources:
+              kinds: [Namespace]
+      generate:
+        synchronize: true             # Resync si modifié manuellement
+        apiVersion: networking.k8s.io/v1
+        kind: NetworkPolicy
+        name: deny-all
+        namespace: "{{request.object.metadata.name}}"
+        data:
+          spec:
+            podSelector: {}
+            policyTypes: [Ingress, Egress]
+
+---
+# POLITIQUE 8: Générer depuis un ConfigMap existant
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: copy-configmap
+spec:
+  rules:
+    - name: copy-default-config
+      match:
+        any:
+          - resources:
+              kinds: [Namespace]
+      generate:
+        synchronize: true
+        apiVersion: v1
+        kind: ConfigMap
+        name: default-config
+        namespace: "{{request.object.metadata.name}}"
+        clone:
+          namespace: default
+          name: default-config       # Copier depuis ce ConfigMap
+
+---
+# POLITIQUE 9: Vérification d'image (supply chain security)
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: verify-image-signature
+spec:
+  validationFailureAction: Enforce
+  rules:
+    - name: check-cosign-signature
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      verifyImages:
+        - imageReferences:
+            - "registry.example.com/*"
+          attestors:
+            - count: 1
+              entries:
+                - keys:
+                    publicKeys: |-
+                      -----BEGIN PUBLIC KEY-----
+                      ...
+                      -----END PUBLIC KEY-----
+                    signatureAlgorithm: sha256
+          mutateDigest: true          # Remplace le tag par le digest
+          required: true
+
+---
+# PolicyException - exclure des ressources d'une politique
+apiVersion: kyverno.io/v2beta1
+kind: PolicyException
+metadata:
+  name: exception-legacy-app
+  namespace: legacy
+spec:
+  exceptions:
+    - policyName: require-labels
+      ruleNames: [check-team-label]
+  match:
+    any:
+      - resources:
+          kinds: [Deployment]
+          namespaces: [legacy]
+          names: [legacy-app]
+
+---
+# ─────────────────────────────────────────────────────────────
+# OPA GATEKEEPER
+# ─────────────────────────────────────────────────────────────
+# Installation:
+#   kubectl apply -f https://raw.githubusercontent.com/open-policy-agent/gatekeeper/release-3.14/deploy/gatekeeper.yaml
+#   # ou Helm:
+#   helm repo add gatekeeper https://open-policy-agent.github.io/gatekeeper/charts
+#   helm install gatekeeper gatekeeper/gatekeeper -n gatekeeper-system --create-namespace
+
+# Étape 1: Définir le ConstraintTemplate (logique Rego)
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8srequiredlabels            # Doit correspondre à spec.crd.spec.names.kind en minuscule
+
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sRequiredLabels      # CRD créé pour la contrainte
+      validation:
+        openAPIV3Schema:
+          type: object
+          properties:
+            labels:
+              type: array
+              items:
+                type: string
+
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8srequiredlabels
+
+        # Violation si un label requis est manquant
+        violation[{"msg": msg, "details": {"missing_labels": missing}}] {
+          # Récupérer les labels requis depuis les paramètres
+          provided := {label | input.review.object.metadata.labels[label]}
+          required := {label | label := input.parameters.labels[_]}
+          missing := required - provided
+          count(missing) > 0
+          msg := sprintf("Labels manquants: %v", [missing])
+        }
+
+---
+# Étape 2: Créer la Constraint (instance de la politique)
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sRequiredLabels              # Référence au ConstraintTemplate
+metadata:
+  name: require-deployment-labels
+
+spec:
+  # ── Mode ────────────────────────────────────────────────
+  enforcementAction: deny            # deny | warn | dryrun
+
+  # ── Scope ───────────────────────────────────────────────
+  match:
+    kinds:
+      - apiGroups: [apps]
+        kinds: [Deployment]
+    namespaces: [production, staging]
+    excludedNamespaces: [kube-system]
+    labelSelector:
+      matchExpressions:
+        - key: skip-policy
+          operator: DoesNotExist
+
+  # ── Paramètres (passés au Rego) ─────────────────────────
+  parameters:
+    labels: [app, owner, version]
+
+---
+# ConstraintTemplate: Interdire hostPath
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8snohostpath
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sNoHostPath
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8snohostpath
+
+        violation[{"msg": msg}] {
+          volume := input.review.object.spec.volumes[_]
+          volume.hostPath
+          msg := sprintf("Volume hostPath interdit: %v", [volume.name])
+        }
+
+---
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sNoHostPath
+metadata:
+  name: no-hostpath
+spec:
+  enforcementAction: deny
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: [Pod]
+
+---
+# ConstraintTemplate: Imposer les limites de ressources
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8scontainerlimits
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sContainerLimits
+      validation:
+        openAPIV3Schema:
+          type: object
+          properties:
+            cpu:
+              type: string
+            memory:
+              type: string
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8scontainerlimits
+
+        missing(obj, field) = true {
+          not obj[field]
+        }
+
+        missing(obj, field) = true {
+          obj[field] == ""
+        }
+
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.containers[_]
+          missing(container.resources.limits, "cpu")
+          msg := sprintf("Container '%v': limit CPU requise", [container.name])
+        }
+
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.containers[_]
+          missing(container.resources.limits, "memory")
+          msg := sprintf("Container '%v': limit mémoire requise", [container.name])
+        }
+
+---
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sContainerLimits
+metadata:
+  name: container-must-have-limits
+spec:
+  enforcementAction: deny
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: [Pod]
+    excludedNamespaces: [kube-system, kube-public]
+
+---
+# Config Gatekeeper (namespace/resource exclusions)
+apiVersion: config.gatekeeper.sh/v1alpha1
+kind: Config
+metadata:
+  name: config
+  namespace: gatekeeper-system
+spec:
+  sync:
+    syncOnly:
+      - group: ""
+        version: v1
+        kind: Namespace
+      - group: apps
+        version: v1
+        kind: Deployment
+  match:
+    - excludedNamespaces: [kube-system, kube-public, kube-node-lease, gatekeeper-system]
+      processes: ["*"]              # audit | webhook | mutation | *
+
+---
+# ─────────────────────────────────────────────────────────────
+# COMMANDES KUBECTL
+# ─────────────────────────────────────────────────────────────
+#
+# Kyverno:
+#   kubectl get clusterpolicies
+#   kubectl get policies -A
+#   kubectl describe clusterpolicy require-labels
+#   # Voir les violations (en mode Audit):
+#   kubectl get policyreport -A
+#   kubectl get clusterpolicyreport
+#   kubectl describe policyreport -n production
+#
+#   # Tester une politique (CLI kyverno):
+#   kyverno apply require-labels.yaml --resource deployment.yaml
+#   kyverno test .                    # Tester toutes les politiques
+#
+# OPA Gatekeeper:
+#   kubectl get constrainttemplates
+#   kubectl get constraints           # Toutes les contraintes
+#   kubectl get k8srequiredlabels     # Contrainte spécifique
+#   kubectl describe k8srequiredlabels require-deployment-labels
+#
+#   # Voir les violations:
+#   kubectl describe k8srequiredlabels require-deployment-labels
+#   # Chercher: violations: []
+#
+#   # Audit manuel:
+#   kubectl annotate constraint require-deployment-labels \
+#     audit.gatekeeper.sh/force-audit=$(date +%s)
+#
+#   # Logs:
+#   kubectl logs -n gatekeeper-system -l control-plane=controller-manager -f
+#   kubectl logs -n gatekeeper-system -l control-plane=audit-controller -f

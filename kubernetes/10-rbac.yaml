@@ -1,0 +1,322 @@
+# ============================================================
+# KUBERNETES RBAC - CHEATSHEET COMPLET
+# ============================================================
+# Role-Based Access Control: contrôle qui peut faire quoi dans le cluster.
+# Objets: ServiceAccount, Role, ClusterRole, RoleBinding, ClusterRoleBinding
+
+# ─────────────────────────────────────────────────────────────
+# SERVICE ACCOUNT
+# ─────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: my-service-account
+  namespace: default
+  labels:
+    app: my-app
+  annotations:
+    # AWS IRSA (IAM Roles for Service Accounts)
+    eks.amazonaws.com/role-arn: "arn:aws:iam::123456789:role/my-role"
+    # GCP Workload Identity
+    iam.gke.io/gcp-service-account: "gsa@project.iam.gserviceaccount.com"
+
+# Désactiver le montage automatique du token
+automountServiceAccountToken: false
+
+# Secrets associés (K8s < 1.24 - maintenant géré automatiquement)
+# secrets:
+#   - name: my-sa-token
+
+# Image pull secrets associés au SA
+imagePullSecrets:
+  - name: registry-credentials
+
+---
+# ─────────────────────────────────────────────────────────────
+# ROLE (permissions dans un namespace)
+# ─────────────────────────────────────────────────────────────
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pod-reader
+  namespace: default
+  labels:
+    app: my-app
+
+rules:
+  # Règle 1: Lecture des pods
+  - apiGroups: [""]                     # "" = core API group
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+
+  # Règle 2: Lecture des logs de pods
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+
+  # Règle 3: Lecture des pods avec sous-ressources
+  - apiGroups: [""]
+    resources: ["pods", "pods/status", "pods/exec", "pods/portforward"]
+    verbs: ["get", "list", "watch", "create"]
+
+  # Règle 4: Gestion complète des ConfigMaps
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # Règle 5: Accès à un ConfigMap spécifique
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["my-specific-configmap"]  # Restriction par nom
+    verbs: ["get", "update"]
+
+  # Règle 6: Deployments
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # Règle 7: Jobs et CronJobs
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+
+  # Règle 8: Ingress
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch"]
+
+  # Règle 9: Non-ressources URL (pour accès à /healthz, /metrics)
+  # (seulement dans ClusterRole)
+
+---
+# Role avec accès large (admin namespace)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: namespace-admin
+  namespace: my-namespace
+rules:
+  - apiGroups: ["*"]                    # Tous les API groups
+    resources: ["*"]                    # Toutes les ressources
+    verbs: ["*"]                        # Toutes les actions
+
+---
+# ─────────────────────────────────────────────────────────────
+# CLUSTERROLE (permissions dans tout le cluster)
+# ─────────────────────────────────────────────────────────────
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cluster-reader
+  labels:
+    rbac.example.com/aggregate-to-monitoring: "true"  # Pour aggrégation
+
+rules:
+  # Ressources cluster-wide (pas de namespace)
+  - apiGroups: [""]
+    resources: ["nodes", "namespaces", "persistentvolumes"]
+    verbs: ["get", "list", "watch"]
+
+  # Métriques
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["nodes", "pods"]
+    verbs: ["get", "list"]
+
+  # Custom Resource Definitions
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "list", "watch"]
+
+  # Non-resource URLs
+  - nonResourceURLs: ["/healthz", "/healthz/*", "/livez", "/readyz"]
+    verbs: ["get"]
+  - nonResourceURLs: ["/metrics"]
+    verbs: ["get"]
+
+---
+# ClusterRole avec aggrégation (combine plusieurs ClusterRoles)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: monitoring
+aggregationRule:
+  clusterRoleSelectors:
+    - matchLabels:
+        rbac.example.com/aggregate-to-monitoring: "true"
+rules: []                               # Rempli automatiquement par aggregation
+
+---
+# ─────────────────────────────────────────────────────────────
+# ROLEBINDING (lie un Role à un sujet dans un namespace)
+# ─────────────────────────────────────────────────────────────
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pod-reader-binding
+  namespace: default
+
+# Qui reçoit les permissions
+subjects:
+  # ServiceAccount
+  - kind: ServiceAccount
+    name: my-service-account
+    namespace: default               # Namespace du SA (requis pour SA)
+
+  # User (authentifié via certificat ou OIDC)
+  - kind: User
+    name: "jane.doe@example.com"
+    apiGroup: rbac.authorization.k8s.io
+
+  # Group
+  - kind: Group
+    name: "dev-team"
+    apiGroup: rbac.authorization.k8s.io
+
+  # Group système (tous les SA d'un namespace)
+  - kind: Group
+    name: "system:serviceaccounts:my-namespace"
+    apiGroup: rbac.authorization.k8s.io
+
+  # Tous les SA authentifiés
+  - kind: Group
+    name: "system:serviceaccounts"
+    apiGroup: rbac.authorization.k8s.io
+
+# Référence au Role ou ClusterRole
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role                          # Role | ClusterRole
+  name: pod-reader                    # Nom du Role/ClusterRole
+
+---
+# RoleBinding vers un ClusterRole (limite au namespace)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: use-clusterrole-in-namespace
+  namespace: staging
+subjects:
+  - kind: ServiceAccount
+    name: deploy-sa
+    namespace: staging
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole                   # ClusterRole utilisé dans un namespace
+  name: cluster-reader                # Limité au namespace "staging"
+
+---
+# ─────────────────────────────────────────────────────────────
+# CLUSTERROLEBINDING (lie un ClusterRole à un sujet, cluster-wide)
+# ─────────────────────────────────────────────────────────────
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cluster-reader-binding
+
+subjects:
+  - kind: ServiceAccount
+    name: monitoring-sa
+    namespace: monitoring
+
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-reader
+
+---
+# ─────────────────────────────────────────────────────────────
+# ROLES PRÉDÉFINIS (ClusterRoles système)
+# ─────────────────────────────────────────────────────────────
+# cluster-admin:   Accès total au cluster
+# admin:           Accès admin namespace (peut gérer RBAC dans le namespace)
+# edit:            Lecture/écriture sur la plupart des ressources (pas RBAC)
+# view:            Lecture seule sur la plupart des ressources
+
+# Exemple: donner admin d'un namespace à un utilisateur
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ns-admin
+  namespace: my-namespace
+subjects:
+  - kind: User
+    name: "alice"
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: admin                         # ClusterRole prédéfini
+
+---
+# ─────────────────────────────────────────────────────────────
+# EXEMPLE COMPLET: SA pour une application
+# ─────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: app-sa
+  namespace: production
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: app-role
+  namespace: production
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps", "secrets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: app-rolebinding
+  namespace: production
+subjects:
+  - kind: ServiceAccount
+    name: app-sa
+    namespace: production
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: app-role
+
+---
+# ─────────────────────────────────────────────────────────────
+# COMMANDES KUBECTL
+# ─────────────────────────────────────────────────────────────
+#
+# Voir les droits:
+#   kubectl auth can-i list pods --as=system:serviceaccount:default:my-sa
+#   kubectl auth can-i create deployments --namespace=production
+#   kubectl auth can-i '*' '*'           # Vérifier si cluster-admin
+#
+# Lister tous les droits d'un SA:
+#   kubectl auth can-i --list --as=system:serviceaccount:default:my-sa
+#
+# Lister les roles:
+#   kubectl get roles,clusterroles
+#   kubectl get rolebindings,clusterrolebindings
+#
+# Voir qui peut faire quoi sur une ressource:
+#   kubectl get clusterrolebinding -o json | jq ...
+#
+# Créer rapidement:
+#   kubectl create serviceaccount my-sa
+#   kubectl create role pod-reader --verb=get,list,watch --resource=pods
+#   kubectl create rolebinding pod-reader-binding --role=pod-reader --serviceaccount=default:my-sa
+#   kubectl create clusterrole node-reader --verb=get,list,watch --resource=nodes
+#   kubectl create clusterrolebinding node-reader-binding --clusterrole=node-reader --serviceaccount=default:my-sa
+#
+# Vérifications utiles:
+#   kubectl describe clusterrole cluster-admin
+#   kubectl describe clusterrole admin
+#   kubectl describe clusterrole edit
+#   kubectl describe clusterrole view
+#
+# Générer un token SA (K8s 1.24+):
+#   kubectl create token my-sa --duration=24h
+#   kubectl create token my-sa --namespace=production
